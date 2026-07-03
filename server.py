@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
-"""cerase-skillcheck — defensive static security scan for third-party skills.
+"""cerase-skillcheck — defensive security scan for third-party skills.
 
-A small HTTP service (FastAPI) that wraps the NVIDIA **skillspector** static
-scanner (Apache-2.0, https://github.com/NVIDIA/skillspector) so the Cerase
-platform can WARN a user, in plain language, before they install a risky
-third-party skill.
+A small HTTP service (FastAPI) that wraps the NVIDIA **skillspector** scanner
+(Apache-2.0, https://github.com/NVIDIA/skillspector) so the Cerase platform can
+WARN a user, in plain language, before they install a risky third-party skill.
 
 This is DEFENSIVE tooling: the verdict is **advisory only** — it never blocks
 an install and never quarantines anything. A caller (the control-plane at an
 import chokepoint, or an agent via a CLI recipe) POSTs a skill and gets back a
 risk verdict it can surface to the user, who always retains the final choice.
 
-Scope (M-SKILLSCAN-1): **static-only**. skillspector's optional LLM analysis is
-disabled here (`--no-llm`); wiring it through our LiteLLM is a later milestone.
+Analysis modes (M-SKILLSCAN-2)
+  - **static**  — skillspector's local ruleset only (`--no-llm`). Always
+    available, dependency-free, no egress.
+  - **llm**     — static ruleset PLUS skillspector's LLM intent analysis,
+    routed through **our** LiteLLM (never a third-party endpoint). Enabled
+    only when `LITELLM_BASE_URL` + `SKILLCHECK_LLM_API_KEY` are configured.
+
+  LLM mode routes skillspector's OpenAI provider at our LiteLLM: it honours a
+  custom `OPENAI_BASE_URL` and reads `OPENAI_API_KEY` (verified against the
+  pinned source), so we point it at `${LITELLM_BASE_URL}/v1` with the service
+  virtual key `cerase-svc-skillcheck` and the `core` model alias. No new
+  sub-processor: whatever `core` maps to is our existing routing/metering.
+
+  **Degrade to static** — a model outage must never block a scan. When LiteLLM
+  is unreachable, misconfigured, or the LLM stage fails at runtime, the scan
+  still returns a *static* verdict flagged `degraded: true` instead of erroring.
 
 Endpoints
-  GET  /healthz        liveness + scanner version.
+  GET  /healthz        liveness + scanner version + LLM configuration.
   POST /scan           JSON {path?|skill_md?} → verdict (mounted dir/file, or
                        raw SKILL.md content).
   POST /scan/bundle    multipart upload of a .zip skill bundle → verdict.
@@ -27,7 +40,8 @@ Verdict JSON
     "recommendation": "SAFE|CAUTION|DO_NOT_INSTALL",
     "findings": [ ... ],                         # skillspector issues[]
     "scanner_version": "2.3.9",
-    "mode": "static",
+    "mode": "static" | "llm",                    # analysis actually performed
+    "degraded": bool,                            # LLM requested but fell back
     "partial": bool,                             # true = SKILL.md-only scan
     "skill_name": str|null,
     "components_scanned": int
@@ -35,26 +49,37 @@ Verdict JSON
 
 skillspector invocation
   We shell out to the pinned CLI:
-      skillspector scan <target> --no-llm --format json --output <tmp.json>
+      skillspector scan <target> [--no-llm] --format json --output <tmp.json>
   and read the JSON report from the output file (decoupled from any console
   chatter on stdout). Exit code 0 (score<=50) and 1 (score>50) both produce a
-  valid report — only exit 2 is a real error. skillspector's SC4 supply-chain
-  check may reach out to OSV.dev; when the network is unavailable it degrades
-  automatically to a built-in fallback list, so the verdict is still returned
-  offline.
+  valid report; exit 2 is a real error (mapped to a degrade fallback in LLM
+  mode). skillspector's SC4 supply-chain check may reach out to OSV.dev; when
+  the network is unavailable it degrades automatically to a built-in fallback
+  list, so the verdict is still returned offline.
 
 Env
-  PORT                    listen port (default 8000).
-  SKILLCHECK_SCAN_TIMEOUT per-scan subprocess timeout, seconds (default 180).
-  SKILLCHECK_MAX_UPLOAD   max bundle upload size, bytes (default 25 MiB).
+  PORT                       listen port (default 8000).
+  SKILLCHECK_SCAN_TIMEOUT    static-scan subprocess timeout, seconds (def 180).
+  SKILLCHECK_LLM_SCAN_TIMEOUT LLM-scan subprocess timeout, seconds (def 300).
+  SKILLCHECK_MAX_UPLOAD      max bundle upload size, bytes (default 25 MiB).
+  LITELLM_BASE_URL           our LiteLLM base (e.g. http://cerase-litellm:4000).
+                             Enables LLM mode when set together with the key.
+  SKILLCHECK_LLM_API_KEY     the LiteLLM service virtual key (cerase-svc-
+                             skillcheck). NEVER the master key. Enables LLM mode.
+  SKILLCHECK_LLM_MODEL       model alias to route at (default "core"; a cheaper
+                             switch is e.g. "spark").
+  SKILLCHECK_LLM_PROBE_TIMEOUT reachability-probe timeout, seconds (default 5).
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -64,17 +89,23 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
 
-MODE = "static"
+logger = logging.getLogger("cerase-skillcheck")
+
+MODE_STATIC = "static"
+MODE_LLM = "llm"
 _VALID_RECOMMENDATIONS = {"SAFE", "CAUTION", "DO_NOT_INSTALL"}
 _VALID_SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 
 _SCAN_TIMEOUT = int(os.environ.get("SKILLCHECK_SCAN_TIMEOUT", "180"))
+_LLM_SCAN_TIMEOUT = int(os.environ.get("SKILLCHECK_LLM_SCAN_TIMEOUT", "300"))
 _MAX_UPLOAD = int(os.environ.get("SKILLCHECK_MAX_UPLOAD", str(25 * 1024 * 1024)))
+_PROBE_TIMEOUT = float(os.environ.get("SKILLCHECK_LLM_PROBE_TIMEOUT", "5"))
+_DEFAULT_LLM_MODEL = "core"
 
 app = FastAPI(
     title="cerase-skillcheck",
-    summary="Defensive static security scan for third-party agent skills.",
-    version="1",
+    summary="Defensive security scan for third-party agent skills.",
+    version="2",
 )
 
 
@@ -84,6 +115,112 @@ def _scanner_version() -> str:
         return _pkg_version("skillspector")
     except PackageNotFoundError:
         return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# LLM configuration (routes skillspector's OpenAI provider at our LiteLLM)
+# ---------------------------------------------------------------------------
+
+
+def _litellm_base_url() -> str:
+    return os.environ.get("LITELLM_BASE_URL", "").strip()
+
+
+def _llm_api_key() -> str:
+    return os.environ.get("SKILLCHECK_LLM_API_KEY", "").strip()
+
+
+def _llm_model() -> str:
+    return os.environ.get("SKILLCHECK_LLM_MODEL", "").strip() or _DEFAULT_LLM_MODEL
+
+
+def _llm_configured() -> bool:
+    """LLM mode is available only when BOTH a base URL and a key are set.
+
+    We deliberately require an explicit service key — never fall back to any
+    ambient/master credential — so a scan cannot silently egress on the wrong
+    identity. Absent either, the service runs static-only.
+    """
+    return bool(_litellm_base_url()) and bool(_llm_api_key())
+
+
+def _openai_base_url() -> str:
+    """The OpenAI-compatible endpoint skillspector should call.
+
+    skillspector's OpenAI provider passes ``OPENAI_BASE_URL`` straight into
+    ``ChatOpenAI(base_url=...)``, whose client expects a ``/v1`` suffix. We
+    normalise ``LITELLM_BASE_URL`` (the routing root, matching cerase-search's
+    convention) into that shape.
+    """
+    base = _litellm_base_url().rstrip("/")
+    if base.endswith("/v1"):
+        return base
+    return base + "/v1"
+
+
+def _litellm_health_url() -> str:
+    """LiteLLM's unauthenticated liveness endpoint (not under /v1)."""
+    base = _litellm_base_url().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base + "/health/liveliness"
+
+
+def _base_scan_env() -> dict[str, str]:
+    """Baseline environment for the skillspector subprocess.
+
+    LangSmith tracing is force-disabled so a scan never phones home; HOME stays
+    writable for any cache the scanner touches.
+    """
+    env = dict(os.environ)
+    env["LANGCHAIN_TRACING_V2"] = "false"
+    env["LANGCHAIN_TRACING"] = "false"
+    env.setdefault("SKILLSPECTOR_LOG_LEVEL", "ERROR")
+    # Strip any ambient OpenAI creds so a static run never has a stray endpoint.
+    for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "SKILLSPECTOR_PROVIDER", "SKILLSPECTOR_MODEL"):
+        env.pop(key, None)
+    return env
+
+
+def _llm_scan_env() -> dict[str, str]:
+    """Environment that points skillspector's OpenAI provider at our LiteLLM.
+
+    Selects the OpenAI provider explicitly, supplies the service virtual key and
+    our LiteLLM base_url, and pins every analyzer slot to the configured model
+    alias (``SKILLSPECTOR_MODEL`` flows through ``constants.MODEL_CONFIG`` to
+    all slots). NOT the master key, NOT CERASE_LLM_API_BASE.
+    """
+    env = _base_scan_env()
+    env["SKILLSPECTOR_PROVIDER"] = "openai"
+    env["OPENAI_API_KEY"] = _llm_api_key()
+    env["OPENAI_BASE_URL"] = _openai_base_url()
+    env["SKILLSPECTOR_MODEL"] = _llm_model()
+    return env
+
+
+def _litellm_reachable() -> bool:
+    """Best-effort reachability probe for LiteLLM's liveness endpoint.
+
+    Any HTTP response (even 4xx/5xx) means the host answered → reachable. Only a
+    transport failure (DNS, connection refused, timeout) counts as unreachable,
+    which lets a scan skip straight to a fast static degrade instead of waiting
+    on per-call LLM timeouts against a dead endpoint.
+    """
+    url = _litellm_health_url()
+    try:
+        with urllib.request.urlopen(url, timeout=_PROBE_TIMEOUT):  # noqa: S310 (internal host)
+            return True
+    except urllib.error.HTTPError:
+        # The server responded with an error status — it is reachable.
+        return True
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        logger.warning("LiteLLM probe failed (%s): %s — degrading to static", url, exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
 
 
 class ScanRequest(BaseModel):
@@ -113,7 +250,8 @@ class Verdict(BaseModel):
     recommendation: str
     findings: list[dict[str, Any]]
     scanner_version: str
-    mode: str = MODE
+    mode: str = MODE_STATIC
+    degraded: bool = False
     partial: bool = False
     skill_name: str | None = None
     components_scanned: int = 0
@@ -123,62 +261,75 @@ class ScanError(RuntimeError):
     """skillspector failed to produce a report (non-verdict error)."""
 
 
-def _scan_env() -> dict[str, str]:
-    """Environment for the skillspector subprocess.
+# ---------------------------------------------------------------------------
+# skillspector subprocess + verdict mapping
+# ---------------------------------------------------------------------------
 
-    Static-only: no LLM provider credentials are passed, and LangSmith tracing
-    is force-disabled so a scan never phones home. HOME is kept writable for any
-    cache the scanner touches.
+
+def _run_skillspector(target: Path, *, use_llm: bool) -> dict[str, Any]:
+    """Run skillspector on *target* and return its parsed JSON report.
+
+    ``use_llm=False`` passes ``--no-llm`` (static-only). ``use_llm=True`` runs
+    the full analysis with skillspector's OpenAI provider pointed at our
+    LiteLLM. Raises :class:`ScanError` when no report is produced.
     """
-    env = dict(os.environ)
-    env["LANGCHAIN_TRACING_V2"] = "false"
-    env["LANGCHAIN_TRACING"] = "false"
-    env.setdefault("SKILLSPECTOR_LOG_LEVEL", "ERROR")
-    return env
+    env = _llm_scan_env() if use_llm else _base_scan_env()
+    timeout = _LLM_SCAN_TIMEOUT if use_llm else _SCAN_TIMEOUT
 
-
-def _run_static_scan(target: Path, *, partial: bool) -> Verdict:
-    """Run skillspector static-only on *target* and map its report to a Verdict."""
     with tempfile.TemporaryDirectory(prefix="skillcheck-out-") as outdir:
         report_path = Path(outdir) / "report.json"
-        cmd = [
-            "skillspector",
-            "scan",
-            str(target),
-            "--no-llm",
-            "--format",
-            "json",
-            "--output",
-            str(report_path),
-        ]
+        cmd = ["skillspector", "scan", str(target)]
+        if not use_llm:
+            cmd.append("--no-llm")
+        cmd += ["--format", "json", "--output", str(report_path)]
         try:
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=_SCAN_TIMEOUT,
-                env=_scan_env(),
+                timeout=timeout,
+                env=env,
             )
         except subprocess.TimeoutExpired as exc:
-            raise ScanError(f"scan timed out after {_SCAN_TIMEOUT}s") from exc
+            raise ScanError(f"scan timed out after {timeout}s") from exc
         except FileNotFoundError as exc:  # skillspector binary missing
             raise ScanError("skillspector executable not found") from exc
 
         # Exit 0 = clean/low, 1 = risky (score>50) — both still write a report.
-        # Exit 2 (or any other) = a real scan error.
+        # Exit 2 (or any other) = a real scan error (e.g. an LLM misconfig that
+        # aborts the graph), surfaced as ScanError so the caller can degrade.
         if not report_path.exists():
             detail = (proc.stderr or proc.stdout or "").strip()[:2000]
             raise ScanError(detail or f"skillspector exited {proc.returncode} with no report")
 
         try:
-            data = json.loads(report_path.read_text(encoding="utf-8"))
+            return json.loads(report_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ScanError(f"could not parse skillspector report: {exc}") from exc
 
-    return _to_verdict(data, partial=partial)
+
+def _llm_outcome(data: dict[str, Any]) -> tuple[str, bool]:
+    """Derive ``(mode, degraded)`` from a skillspector report's metadata.
+
+    skillspector records LLM runtime truth in ``metadata``:
+      - ``llm_requested``        the LLM stage was asked for (not --no-llm).
+      - ``meta_analysis_applied``the LLM stage effectively ran (requested,
+                                 available, and not fully degraded).
+    When the LLM was requested but did not effectively run — LiteLLM
+    unreachable, bad key, or every call failing at runtime — the report already
+    reflects static analysis only, so we label it ``static`` + ``degraded``.
+    """
+    meta = data.get("metadata") or {}
+    requested = bool(meta.get("llm_requested"))
+    applied = bool(meta.get("meta_analysis_applied"))
+    if not requested:
+        return MODE_STATIC, False
+    if applied:
+        return MODE_LLM, False
+    return MODE_STATIC, True
 
 
-def _to_verdict(data: dict[str, Any], *, partial: bool) -> Verdict:
+def _to_verdict(data: dict[str, Any], *, partial: bool, mode: str, degraded: bool) -> Verdict:
     """Map a skillspector JSON report into our advisory Verdict.
 
     Defensive: clamps/normalises every field so a schema drift in the scanner
@@ -215,33 +366,79 @@ def _to_verdict(data: dict[str, Any], *, partial: bool) -> Verdict:
         recommendation=recommendation,
         findings=findings,
         scanner_version=str(meta.get("skillspector_version") or _scanner_version()),
-        mode=MODE,
+        mode=mode,
+        degraded=degraded,
         partial=partial,
         skill_name=skill.get("name"),
         components_scanned=components_scanned,
     )
 
 
+def _scan_target(target: Path, *, partial: bool) -> Verdict:
+    """Scan *target*, running LLM-assisted analysis when configured.
+
+    Order of preference, always producing a verdict (never an error) when
+    skillspector can run at all:
+      1. LLM not configured        → static scan, mode=static.
+      2. LLM configured, LiteLLM
+         unreachable               → static scan, mode=static, degraded=true.
+      3. LLM configured + reachable → LLM scan; map mode/degraded from the
+         report metadata (a runtime LLM failure still yields a static verdict
+         flagged degraded).
+      4. LLM scan raises (exit 2 /
+         timeout / no report)      → static fallback, mode=static, degraded=true.
+    """
+    if not _llm_configured():
+        data = _run_skillspector(target, use_llm=False)
+        return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=False)
+
+    if not _litellm_reachable():
+        data = _run_skillspector(target, use_llm=False)
+        return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
+
+    try:
+        data = _run_skillspector(target, use_llm=True)
+    except ScanError as exc:
+        # LLM run aborted (e.g. graph-level misconfig) — never block the scan;
+        # fall back to a clean static run and flag the degradation.
+        logger.warning("LLM scan failed (%s) — falling back to static", exc)
+        data = _run_skillspector(target, use_llm=False)
+        return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
+
+    mode, degraded = _llm_outcome(data)
+    return _to_verdict(data, partial=partial, mode=mode, degraded=degraded)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
-    """Liveness probe + scanner identity."""
+    """Liveness probe + scanner identity + LLM configuration."""
     version = _scanner_version()
+    llm_on = _llm_configured()
     return {
         "status": "ok",
         "service": "cerase-skillcheck",
         "scanner": "skillspector",
         "scanner_version": version,
         "scanner_available": version != "unknown",
-        "mode": MODE,
+        "llm_configured": llm_on,
+        "llm_model": _llm_model() if llm_on else None,
+        "mode": MODE_LLM if llm_on else MODE_STATIC,
     }
 
 
 @app.post("/scan", response_model=Verdict)
 def scan(req: ScanRequest) -> Verdict:
-    """Scan a mounted path or raw SKILL.md content, static-only.
+    """Scan a mounted path or raw SKILL.md content.
 
     A directory is a full scan; a lone `.md` file or `skill_md` content is a
     SKILL.md-only (partial) scan whose weaker coverage is flagged in `partial`.
+    LLM-assisted analysis runs when configured, else static-only; either way a
+    verdict is returned (a model outage degrades to static, never a 5xx).
     """
     if req.path:
         target = Path(req.path)
@@ -249,7 +446,7 @@ def scan(req: ScanRequest) -> Verdict:
             raise HTTPException(status_code=404, detail=f"path not found: {req.path}")
         partial = target.is_file() and target.suffix.lower() == ".md"
         try:
-            return _run_static_scan(target, partial=partial)
+            return _scan_target(target, partial=partial)
         except ScanError as exc:
             raise HTTPException(status_code=422, detail=f"scan failed: {exc}") from exc
 
@@ -258,7 +455,7 @@ def scan(req: ScanRequest) -> Verdict:
         md_path = Path(tmp) / "SKILL.md"
         md_path.write_text(req.skill_md or "", encoding="utf-8")
         try:
-            return _run_static_scan(md_path, partial=True)
+            return _scan_target(md_path, partial=True)
         except ScanError as exc:
             raise HTTPException(status_code=422, detail=f"scan failed: {exc}") from exc
 
@@ -288,7 +485,7 @@ async def scan_bundle(file: UploadFile) -> Verdict:
 
         root = _skill_root(extract_dir)
         try:
-            return _run_static_scan(root, partial=False)
+            return _scan_target(root, partial=False)
         except ScanError as exc:
             raise HTTPException(status_code=422, detail=f"scan failed: {exc}") from exc
     finally:

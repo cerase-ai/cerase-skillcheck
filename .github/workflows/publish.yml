@@ -96,7 +96,7 @@ jobs:
             type=sha,prefix=sha-,format=short
           labels: |
             org.opencontainers.image.title=cerase-skillcheck
-            org.opencontainers.image.description=Defensive static security scan for third-party agent skills
+            org.opencontainers.image.description=Defensive security scan for third-party agent skills (static + LLM-assisted via our LiteLLM)
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
 
