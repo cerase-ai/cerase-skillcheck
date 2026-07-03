@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "namespace": "studio.guidance",
+  "name": "cerase-skillcheck",
+  "type": "service",
+  "display_name": "Cerase Skillcheck",
+  "description": "Defensive static security scan for third-party skills (advisory verdict, never blocks). Wraps NVIDIA skillspector.",
+  "license": "Apache-2.0",
+  "install": {
+    "image": "ghcr.io/cerase-ai/cerase-skillcheck:latest"
+  }
+}

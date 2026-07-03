@@ -1,0 +1,40 @@
+name: ghcr-retention
+
+# Cap GHCR storage for this repo's single package. Every push to main publishes
+# an image, and buildx leaves UNTAGGED manifest versions that accumulate
+# forever. Deleting untagged versions is 100% safe — they are never referenced
+# by latest/main/sha-*/v* — so this runs unattended.
+#
+# Pruning the TAGGED sha-<short> history keeps the newest ~10 and NEVER touches
+# latest/main/v* releases (ignore-versions). ⚠️ FIRST RUN: trigger manually
+# (workflow_dispatch) and check the log — for org-owned packages GITHUB_TOKEN
+# may 403; if so, pass a PAT with delete:packages via
+# `token: ${{ secrets.GHCR_CLEANUP_PAT }}`.
+
+on:
+  schedule:
+    # Weekly, Monday 04:35 UTC (offset from sibling package repos).
+    - cron: '35 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete untagged versions of cerase-skillcheck
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: cerase-skillcheck
+          package-type: container
+          delete-only-untagged-versions: 'true'
+
+      - name: Prune old sha-* tags of cerase-skillcheck (keep newest 10)
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: cerase-skillcheck
+          package-type: container
+          min-versions-to-keep: 10
+          ignore-versions: '^(latest|main|v[0-9].*)$'

@@ -1,0 +1,21 @@
+# Keep the build context lean: never ship VCS metadata, caches, or tests into
+# the image layer or the build cache. Build inputs (requirements.txt, server.py,
+# Dockerfile) are deliberately NOT excluded.
+.git/
+.gitignore
+.dockerignore
+.github/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+tests/
+test_*.py
+*_test.py
+conftest.py
+README.md
+NOTICE

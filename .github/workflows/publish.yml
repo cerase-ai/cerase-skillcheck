@@ -1,0 +1,113 @@
+name: Build & publish Docker image
+
+# Publishes ghcr.io/cerase-ai/cerase-skillcheck from this repo (canonical
+# source). Tagging matches the platform convention:
+#   - push to main           → main, latest, sha-<short>
+#   - push of a `v*` git tag → vX.Y.Z, X.Y, latest
+#   - pull_request           → build-only validation, no push
+#   - workflow_dispatch      → manual trigger from the Actions UI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: cerase-skillcheck
+
+jobs:
+  # Cheap grep-only gate: the image MUST declare a non-root USER, a pinned base
+  # (reproducible builds), and a HEALTHCHECK (the liveness signal doctor and
+  # `docker ps` read). Fails the build early.
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Dockerfile hygiene (non-root USER, pinned base, HEALTHCHECK)
+        run: |
+          set -euo pipefail
+          df=Dockerfile
+
+          user_line=$(grep -E '^USER ' "$df" | tail -n1 || true)
+          if [ -z "$user_line" ]; then
+            echo "::error file=$df::no USER instruction — image would run as root"; exit 1
+          fi
+          user=$(echo "$user_line" | awk '{print $2}')
+          if [ "$user" = root ] || [ "$user" = 0 ]; then
+            echo "::error file=$df::USER is root ($user)"; exit 1
+          fi
+          echo "OK: non-root USER=$user"
+
+          from_line=$(grep -E '^FROM ' "$df" | tail -n1 || true)
+          if ! echo "$from_line" | grep -Eq '@sha256:[0-9a-f]{64}|:[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error file=$df::base image not pinned to MAJOR.MINOR.PATCH or @sha256: $from_line"; exit 1
+          fi
+          echo "OK: pinned base — $from_line"
+
+          if ! grep -Eq '^HEALTHCHECK ' "$df"; then
+            echo "::error file=$df::no HEALTHCHECK instruction"; exit 1
+          fi
+          echo "OK: HEALTHCHECK present"
+
+  build-and-push:
+    needs: [hygiene]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Fresh package created by this repo's first push, so the repo-scoped
+      # GITHUB_TOKEN can create + write it. If the package is later relinked to
+      # another repo and pushes 403, switch to an org-admin PAT (GHCR_TOKEN).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata + tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=cerase-skillcheck
+            org.opencontainers.image.description=Defensive static security scan for third-party agent skills
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.IMAGE }}
+          cache-to: type=gha,mode=max,scope=${{ env.IMAGE }}
+          provenance: false

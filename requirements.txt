@@ -1,0 +1,11 @@
+# cerase-skillcheck — defensive static skill scanner.
+#
+# A FastAPI HTTP service wrapping NVIDIA skillspector (Apache-2.0) in
+# static-only mode. skillspector is not on PyPI; it is pinned to an immutable
+# commit so builds are reproducible. Bump the @<sha> + rebuild the image to
+# update the ruleset/scanner version. skillspector pulls its own heavy tree
+# (langgraph / langchain / openai / yara-python) transitively.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9
+skillspector @ git+https://github.com/NVIDIA/skillspector.git@326a2b489411a20ed742ff13701be39ba00063c8
