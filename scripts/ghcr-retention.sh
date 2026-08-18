@@ -121,7 +121,19 @@ echo "read $(jq length "$WORK/versions.json") versions of $PACKAGE via $BASE"
 # Deleting a version needs the Admin role on the package; pushing to it needs
 # only Write. A package stays linked to the repository that first published it,
 # so a repo that took over the build can hold Write and nothing more.
-LINKED="$(gh api "$ORG_PATH" --jq '.repository.full_name' 2>/dev/null || echo unknown)"
+#
+# The value is NORMALISED because it came back empty on the first real run and
+# both messages lost the one fact that tells an operator where to go: the log
+# read "is linked to  while this workflow runs in cerase-ai/cerase-core" and the
+# refusal read "run the retention from ,". GitHub omits the `repository` object
+# from the org-level package response when the calling token cannot see the
+# linked repository -- which is precisely the case this whole note exists for, a
+# package linked to a repo that is not this one -- and jq then prints nothing
+# while gh still exits 0, so the `|| echo` fallback never fires.
+LINKED="$(gh api "$ORG_PATH" --jq '.repository.full_name // empty' 2>/dev/null || true)"
+if [ -z "$LINKED" ]; then
+  LINKED="a repository this token cannot see"
+fi
 if [ -n "$RUNNING_IN" ] && [ "$LINKED" != "$RUNNING_IN" ]; then
   echo "note: $PACKAGE is linked to $LINKED while this workflow runs in $RUNNING_IN"
   echo "note: if a delete below is refused, the missing Admin grant on the package is why"
@@ -154,7 +166,7 @@ while read -r id created tags; do
   # package, so a version that reads back is one this token may not delete.
   if gh api "$BASE/versions/$id" >/dev/null 2>&1; then
     echo "::error::refused to delete version $id of $PACKAGE, which still exists."
-    echo "::error::Deleting needs the Admin role on the package and this token appears to hold Write. Grant this repository Admin on the package in the organization package settings, run the retention from $LINKED, or supply a token carrying delete:packages."
+    echo "::error::Deleting needs the Admin role on the package and this token appears to hold Write. Grant this repository Admin on the package in the organization package settings, run the retention from the repository it is linked to ($LINKED), or supply a token carrying delete:packages."
     exit 1
   fi
   echo "version $id was already gone, skipped"
