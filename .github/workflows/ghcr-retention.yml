@@ -1,40 +1,49 @@
 name: ghcr-retention
 
-# Cap GHCR storage for this repo's single package. Every push to main publishes
-# an image, and buildx leaves UNTAGGED manifest versions that accumulate
-# forever. Deleting untagged versions is 100% safe — they are never referenced
-# by latest/main/sha-*/v* — so this runs unattended.
+# Cap GHCR storage for this repo's package. Every push to main publishes an
+# image, so the sha- tagged history grows without bound, and a manifest that
+# loses its tag stays behind as an untagged version.
 #
-# Pruning the TAGGED sha-<short> history keeps the newest ~10 and NEVER touches
-# latest/main/v* releases (ignore-versions). ⚠️ FIRST RUN: trigger manually
-# (workflow_dispatch) and check the log — for org-owned packages GITHUB_TOKEN
-# may 403; if so, pass a PAT with delete:packages via
-# `token: ${{ secrets.GHCR_CLEANUP_PAT }}`.
+# The pruning itself is `scripts/ghcr-retention.sh`, which cerase-core owns and
+# every repo with a retention workflow carries a byte-identical copy of. The copy
+# here is written by `scripts/sync-tooling.sh` in cerase-core and pinned by
+# `scripts/TOOLING.sha256`; the step below verifies the pin before running the
+# script, so an edited copy stops the run instead of pruning with it. Do not edit
+# the copy — the edit is what the pin exists to catch. Why the script calls the
+# GHCR API rather than actions/delete-package-versions is in its own header.
+#
+# The floor is lower here than in cerase-core because this package gains one
+# version per push to one repo, not one per push to a repo that builds nine.
 
 on:
   schedule:
-    # Weekly, Monday 04:35 UTC (offset from sibling package repos).
+    # Weekly, Monday, offset from the sibling package repos so the runs do not
+    # contend on the same registry at the same minute.
     - cron: '35 4 * * 1'
   workflow_dispatch:
 
 permissions:
+  contents: read
   packages: write
 
 jobs:
   prune:
     runs-on: ubuntu-latest
+    env:
+      PACKAGE: cerase-skillcheck
+      KEEP: 10
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Delete untagged versions of cerase-skillcheck
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: cerase-skillcheck
-          package-type: container
-          delete-only-untagged-versions: 'true'
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Prune old sha-* tags of cerase-skillcheck (keep newest 10)
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: cerase-skillcheck
-          package-type: container
-          min-versions-to-keep: 10
-          ignore-versions: '^(latest|main|v[0-9].*)$'
+      # The grep is half the check: sha256sum passes a pin that no longer lists
+      # the file, and a pin that pins nothing is the failure this cannot afford.
+      - name: Verify the vendored tooling against its pin
+        run: |
+          set -euo pipefail
+          grep -q 'scripts/ghcr-retention.sh' scripts/TOOLING.sha256
+          sha256sum --check scripts/TOOLING.sha256
+
+      - name: Prune GHCR versions of cerase-skillcheck to its retention floor
+        run: bash scripts/ghcr-retention.sh
