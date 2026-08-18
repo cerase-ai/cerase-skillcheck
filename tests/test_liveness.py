@@ -13,7 +13,7 @@ Nothing in the previous suite could have caught it: every test either drove a
 live service one request at a time, or exercised pure helpers. The defect only
 exists when a second request arrives during the first.
 
-Two guards, deliberately of different kinds:
+Three kinds of guard, deliberately different:
 
   1. **Behavioural** — drive the ASGI app with two concurrent requests and
      require the health probe to finish FIRST. Run against the pre-fix code the
@@ -21,6 +21,9 @@ Two guards, deliberately of different kinds:
   2. **Structural** — no ``async def`` in server.py may call a blocking function
      directly. This catches the next endpoint written the same way, before it
      ships, without needing a slow scan to reproduce.
+  3. **The image** — the HEALTHCHECK numbers and the init that reaps its probes.
+     They are what the container the fleet runs actually gets, because the
+     control-plane's starter creates it with ``docker run``.
 
 Run from the package root::
 
@@ -31,6 +34,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import io
+import re
 import sys
 import threading
 import time
@@ -217,3 +221,70 @@ def test_healthz_is_an_async_handler():
     that must always answer is the one that must not need a worker.
     """
     assert asyncio.iscoroutinefunction(server.healthz)
+
+
+# ---------------------------------------------------------------------------
+# The image, which is where this container's real healthcheck comes from
+# ---------------------------------------------------------------------------
+
+DOCKERFILE = Path(__file__).resolve().parent.parent / "Dockerfile"
+
+# cerase-core's docker-compose.yml declares a healthcheck for this service too,
+# and the two are NOT overrides of each other: the container the fleet runs is
+# created by the control-plane's on-demand starter with `docker run`, which
+# carries the image's and nothing from compose. They disagreed once — 5s in the
+# file being read, 10s on the container being debugged — and an operator spent
+# an afternoon on the gap. Each repo pins the pair from its own end, because CI
+# checks out one repo and a test that reads the other runs nowhere that stops a
+# push. Change these and change tests/unit/skillcheck_liveness.bats over there.
+EXPECTED_HEALTHCHECK_FLAGS = {
+    "interval": "30s",
+    "timeout": "10s",
+    "start-period": "40s",
+    "retries": "3",
+}
+
+
+def _healthcheck_instruction() -> str:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    match = re.search(r"^HEALTHCHECK .*?(?=\n[A-Z]+ |\Z)", text, re.M | re.S)
+    assert match, "the image declares no HEALTHCHECK"
+    return match.group(0)
+
+
+def test_the_image_healthcheck_matches_what_compose_was_pinned_to():
+    instruction = _healthcheck_instruction()
+    wrong = {}
+    for flag, expected in EXPECTED_HEALTHCHECK_FLAGS.items():
+        found = re.search(rf"--{flag}=(\S+)", instruction)
+        actual = found.group(1) if found else None
+        if actual != expected:
+            wrong[flag] = (actual, expected)
+    assert not wrong, f"healthcheck flags drifted from the compose pin: {wrong}"
+
+
+def test_the_probe_carries_its_own_timeout():
+    """A probe the daemon has to kill logs an empty line instead of a reason.
+
+    The health log the operator read said only "Health check exceeded timeout
+    (10s)" with no output at all, because the daemon killed a probe that had no
+    deadline of its own.
+    """
+    instruction = _healthcheck_instruction()
+    assert "/healthz" in instruction
+    assert "timeout=5" in instruction
+
+
+def test_pid_one_is_an_init():
+    """uvicorn does not reap, and every health probe is a child of PID 1.
+
+    Eleven zombies were counted in a container that had been up two hours, and
+    the count only goes one way. In the image rather than a compose `init: true`
+    for the same reason as the healthcheck above.
+    """
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    entrypoint = re.search(r"^ENTRYPOINT .*$", text, re.M)
+    assert entrypoint, "no ENTRYPOINT"
+    assert '"/usr/bin/tini"' in entrypoint.group(0), (
+        f"PID 1 is not an init: {entrypoint.group(0)}"
+    )
