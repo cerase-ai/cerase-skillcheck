@@ -46,7 +46,20 @@ WORKDIR /app
 EXPOSE 8000
 
 # Liveness signal for compose/doctor. python-only probe (no curl in slim).
+#
+# This is the ONLY healthcheck definition for this service, on purpose. The
+# container is not always created by compose — the control-plane's on-demand
+# starter creates it with `docker run`, which carries the image's HEALTHCHECK and
+# nothing from any compose file. A second definition in compose is therefore not
+# an override but a fork that applies to some containers and not others, and it
+# already cost an operator an afternoon: the compose file said 5s, the running
+# container reported failures at 10s, and both numbers were correct about
+# different containers.
+#
+# The probe carries its own 5s timeout so it fails with a message instead of
+# being killed by the daemon at --timeout with an empty log line. It reads PORT
+# the same way the entrypoint does, so the two cannot drift.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)" || exit 1
+    CMD python -c "import os,sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT','8000'), timeout=5).status==200 else 1)"
 
 ENTRYPOINT ["sh", "-c", "exec uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]

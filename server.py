@@ -28,10 +28,24 @@ Analysis modes (M-SKILLSCAN-2)
   still returns a *static* verdict flagged `degraded: true` instead of erroring.
 
 Endpoints
-  GET  /healthz        liveness + scanner version + LLM configuration.
+  GET  /healthz        liveness + scanner version + LLM configuration + how many
+                       scans are running right now.
   POST /scan           JSON {path?|skill_md?} → verdict (mounted dir/file, or
                        raw SKILL.md content).
   POST /scan/bundle    multipart upload of a .zip skill bundle → verdict.
+
+Liveness while busy
+  A scan is a blocking subprocess that can run for minutes. Every scan therefore
+  runs in the threadpool and NEVER on the event loop, so ``/healthz`` — an async
+  handler that touches nothing but memory — is answered while scans are in
+  flight. This is not a refinement: an ``async def`` endpoint that called the
+  scan directly held the only event loop for the whole scan, and every request
+  behind it, health probe included, sat unanswered until the scan returned. The
+  container was then marked unhealthy for doing the one thing it exists for, and
+  the caller read that as an outage.
+
+  ``/healthz`` reports ``scans_in_flight`` and ``busy`` so a reader can tell a
+  working scanner from a stuck one instead of inferring it from a silence.
 
 Verdict JSON
   {
@@ -61,6 +75,14 @@ Env
   PORT                       listen port (default 8000).
   SKILLCHECK_SCAN_TIMEOUT    static-scan subprocess timeout, seconds (def 180).
   SKILLCHECK_LLM_SCAN_TIMEOUT LLM-scan subprocess timeout, seconds (def 300).
+  SKILLCHECK_SCAN_DEADLINE   wall-clock ceiling for ONE request, seconds (def
+                             420), covering the LLM attempt AND the static
+                             fallback AND any wait for a scan slot. Without it
+                             the two step timeouts add up (300 + 180) and no
+                             single number bounds a request.
+  SKILLCHECK_MAX_CONCURRENT_SCANS how many skillspector subprocesses may run at
+                             once (default 2). Each is a heavy tree; further
+                             requests wait for a slot inside their own deadline.
   SKILLCHECK_MAX_UPLOAD      max bundle upload size, bytes (default 25 MiB).
   LITELLM_BASE_URL           our LiteLLM base (e.g. http://cerase-litellm:4000).
                              Enables LLM mode when set together with the key.
@@ -72,15 +94,21 @@ Env
 """
 from __future__ import annotations
 
+import contextlib
+import itertools
 import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
+from collections.abc import Iterator
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -88,6 +116,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
+from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger("cerase-skillcheck")
 
@@ -98,6 +127,8 @@ _VALID_SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 
 _SCAN_TIMEOUT = int(os.environ.get("SKILLCHECK_SCAN_TIMEOUT", "180"))
 _LLM_SCAN_TIMEOUT = int(os.environ.get("SKILLCHECK_LLM_SCAN_TIMEOUT", "300"))
+_SCAN_DEADLINE = float(os.environ.get("SKILLCHECK_SCAN_DEADLINE", "420"))
+_MAX_CONCURRENT_SCANS = max(1, int(os.environ.get("SKILLCHECK_MAX_CONCURRENT_SCANS", "2")))
 _MAX_UPLOAD = int(os.environ.get("SKILLCHECK_MAX_UPLOAD", str(25 * 1024 * 1024)))
 _PROBE_TIMEOUT = float(os.environ.get("SKILLCHECK_LLM_PROBE_TIMEOUT", "5"))
 _DEFAULT_LLM_MODEL = "core"
@@ -108,13 +139,88 @@ app = FastAPI(
     version="2",
 )
 
+_SCANNER_VERSION: str | None = None
+
 
 def _scanner_version() -> str:
-    """skillspector package version — cheap (reads metadata, no heavy import)."""
+    """skillspector package version, resolved once and then held in memory.
+
+    ``/healthz`` reads this on the event loop, so it must never reach the disk
+    after the first call: reading package metadata is cheap but it is still I/O,
+    and the whole point of that handler is that it can answer while every worker
+    is busy.
+    """
+    global _SCANNER_VERSION
+    if _SCANNER_VERSION is None:
+        try:
+            _SCANNER_VERSION = _pkg_version("skillspector")
+        except PackageNotFoundError:
+            _SCANNER_VERSION = "unknown"
+    return _SCANNER_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Scan admission: a wall-clock budget per request + a bounded number of slots
+# ---------------------------------------------------------------------------
+
+
+class Budget:
+    """The wall-clock allowance for ONE scan request, shared by every step.
+
+    A scan can run the LLM stage, fail, and then run a full static fallback; the
+    two step timeouts are independent, so before this the only ceiling on a
+    request was their sum. Every blocking step asks the budget how much time is
+    left and takes the smaller of that and its own timeout, so one request has
+    one number bounding it end to end.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.total = max(1.0, float(seconds))
+        self._deadline = time.monotonic() + self.total
+
+    def remaining(self) -> float:
+        return self._deadline - time.monotonic()
+
+
+_scan_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_SCANS)
+_scan_registry_lock = threading.Lock()
+_scan_registry: dict[int, float] = {}
+_scan_ids = itertools.count(1)
+
+
+@contextlib.contextmanager
+def _scan_slot(budget: Budget) -> Iterator[None]:
+    """Hold one scan slot for the duration of a scan, or fail inside the budget.
+
+    Each skillspector run is a heavy subprocess, so the number that may run at
+    once is bounded rather than left to however many requests arrive. A request
+    that cannot get a slot waits only as long as its own budget allows and then
+    fails as a scan error — never indefinitely, and never silently.
+    """
+    wait = budget.remaining()
+    if wait <= 0 or not _scan_slots.acquire(timeout=wait):
+        raise ScanError(
+            f"no scan slot free within {budget.total:.0f}s "
+            f"({_MAX_CONCURRENT_SCANS} concurrent scans allowed)"
+        )
+    scan_id = next(_scan_ids)
+    with _scan_registry_lock:
+        _scan_registry[scan_id] = time.monotonic()
     try:
-        return _pkg_version("skillspector")
-    except PackageNotFoundError:
-        return "unknown"
+        yield
+    finally:
+        with _scan_registry_lock:
+            _scan_registry.pop(scan_id, None)
+        _scan_slots.release()
+
+
+def _scans_in_flight() -> tuple[int, float]:
+    """(how many scans are running, how long the oldest has been running)."""
+    with _scan_registry_lock:
+        started = list(_scan_registry.values())
+    if not started:
+        return 0, 0.0
+    return len(started), time.monotonic() - min(started)
 
 
 # ---------------------------------------------------------------------------
@@ -266,15 +372,38 @@ class ScanError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _run_skillspector(target: Path, *, use_llm: bool) -> dict[str, Any]:
+def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Kill the scan subprocess AND anything it started.
+
+    The scanner is launched in its own session, so one signal to the process
+    group reaches whatever it spawned. Killing the direct child alone leaves an
+    orphan holding the upstream connection we are timing out on, which is the
+    opposite of a bounded scan.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+
+
+def _run_skillspector(target: Path, *, use_llm: bool, budget: Budget) -> dict[str, Any]:
     """Run skillspector on *target* and return its parsed JSON report.
 
     ``use_llm=False`` passes ``--no-llm`` (static-only). ``use_llm=True`` runs
     the full analysis with skillspector's OpenAI provider pointed at our
-    LiteLLM. Raises :class:`ScanError` when no report is produced.
+    LiteLLM. The step timeout is the smaller of its own ceiling and what is left
+    of the request's *budget*. Raises :class:`ScanError` when no report is
+    produced.
+
+    ALWAYS runs on a worker thread, never on the event loop — see the module
+    docstring. It blocks for as long as the scan takes.
     """
     env = _llm_scan_env() if use_llm else _base_scan_env()
-    timeout = _LLM_SCAN_TIMEOUT if use_llm else _SCAN_TIMEOUT
+    step = float(_LLM_SCAN_TIMEOUT if use_llm else _SCAN_TIMEOUT)
+    timeout = min(step, budget.remaining())
+    if timeout <= 0:
+        raise ScanError(f"scan budget of {budget.total:.0f}s exhausted before the scan could start")
 
     with tempfile.TemporaryDirectory(prefix="skillcheck-out-") as outdir:
         report_path = Path(outdir) / "report.json"
@@ -283,23 +412,30 @@ def _run_skillspector(target: Path, *, use_llm: bool) -> dict[str, Any]:
             cmd.append("--no-llm")
         cmd += ["--format", "json", "--output", str(report_path)]
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(  # noqa: S603 (fixed argv, no shell)
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 env=env,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise ScanError(f"scan timed out after {timeout}s") from exc
         except FileNotFoundError as exc:  # skillspector binary missing
             raise ScanError("skillspector executable not found") from exc
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_tree(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=10)
+            raise ScanError(f"scan timed out after {timeout:.0f}s and was killed") from exc
 
         # Exit 0 = clean/low, 1 = risky (score>50) — both still write a report.
         # Exit 2 (or any other) = a real scan error (e.g. an LLM misconfig that
         # aborts the graph), surfaced as ScanError so the caller can degrade.
         if not report_path.exists():
-            detail = (proc.stderr or proc.stdout or "").strip()[:2000]
+            detail = (stderr or stdout or "").strip()[:2000]
             raise ScanError(detail or f"skillspector exited {proc.returncode} with no report")
 
         try:
@@ -387,26 +523,33 @@ def _scan_target(target: Path, *, partial: bool) -> Verdict:
          flagged degraded).
       4. LLM scan raises (exit 2 /
          timeout / no report)      → static fallback, mode=static, degraded=true.
+
+    The whole sequence runs inside ONE budget and holds ONE scan slot, so a
+    request cannot outlive ``SKILLCHECK_SCAN_DEADLINE`` however many steps it
+    takes. Blocking throughout — callers must reach it off the event loop.
     """
-    if not _llm_configured():
-        data = _run_skillspector(target, use_llm=False)
-        return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=False)
+    budget = Budget(_SCAN_DEADLINE)
+    with _scan_slot(budget):
+        if not _llm_configured():
+            data = _run_skillspector(target, use_llm=False, budget=budget)
+            return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=False)
 
-    if not _litellm_reachable():
-        data = _run_skillspector(target, use_llm=False)
-        return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
+        if not _litellm_reachable():
+            data = _run_skillspector(target, use_llm=False, budget=budget)
+            return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
 
-    try:
-        data = _run_skillspector(target, use_llm=True)
-    except ScanError as exc:
-        # LLM run aborted (e.g. graph-level misconfig) — never block the scan;
-        # fall back to a clean static run and flag the degradation.
-        logger.warning("LLM scan failed (%s) — falling back to static", exc)
-        data = _run_skillspector(target, use_llm=False)
-        return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
+        try:
+            data = _run_skillspector(target, use_llm=True, budget=budget)
+        except ScanError as exc:
+            # LLM run aborted (e.g. graph-level misconfig) — never block the
+            # scan; fall back to a static run on whatever budget is left and
+            # flag the degradation.
+            logger.warning("LLM scan failed (%s) — falling back to static", exc)
+            data = _run_skillspector(target, use_llm=False, budget=budget)
+            return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
 
-    mode, degraded = _llm_outcome(data)
-    return _to_verdict(data, partial=partial, mode=mode, degraded=degraded)
+        mode, degraded = _llm_outcome(data)
+        return _to_verdict(data, partial=partial, mode=mode, degraded=degraded)
 
 
 # ---------------------------------------------------------------------------
@@ -415,10 +558,20 @@ def _scan_target(target: Path, *, partial: bool) -> Verdict:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, Any]:
-    """Liveness probe + scanner identity + LLM configuration."""
+async def healthz() -> dict[str, Any]:
+    """Liveness probe + scanner identity + LLM configuration + current load.
+
+    ``async`` and free of I/O on purpose: it is answered directly on the event
+    loop, so it stays available no matter how many worker threads are inside a
+    scan. A probe that queues behind the work reports a busy service as a dead
+    one, which is exactly what it used to do.
+
+    ``scans_in_flight`` / ``busy`` let a caller distinguish the two states this
+    endpoint used to collapse into silence.
+    """
     version = _scanner_version()
     llm_on = _llm_configured()
+    in_flight, oldest_age = _scans_in_flight()
     return {
         "status": "ok",
         "service": "cerase-skillcheck",
@@ -428,6 +581,11 @@ def healthz() -> dict[str, Any]:
         "llm_configured": llm_on,
         "llm_model": _llm_model() if llm_on else None,
         "mode": MODE_LLM if llm_on else MODE_STATIC,
+        "scans_in_flight": in_flight,
+        "busy": in_flight > 0,
+        "oldest_scan_seconds": round(oldest_age, 1),
+        "max_concurrent_scans": _MAX_CONCURRENT_SCANS,
+        "scan_deadline_seconds": _SCAN_DEADLINE,
     }
 
 
@@ -462,7 +620,13 @@ def scan(req: ScanRequest) -> Verdict:
 
 @app.post("/scan/bundle", response_model=Verdict)
 async def scan_bundle(file: UploadFile) -> Verdict:
-    """Scan an uploaded **.zip** skill bundle (full directory scan)."""
+    """Scan an uploaded **.zip** skill bundle (full directory scan).
+
+    Only the upload is awaited here. Extraction and the scan are blocking and go
+    to the threadpool, because this handler runs on the event loop and calling
+    them directly stopped the whole service — health probe included — for the
+    length of the scan.
+    """
     name = (file.filename or "").lower()
     if not name.endswith(".zip"):
         raise HTTPException(status_code=415, detail="only .zip bundles are supported")
@@ -473,6 +637,11 @@ async def scan_bundle(file: UploadFile) -> Verdict:
             status_code=413, detail=f"bundle exceeds {_MAX_UPLOAD} bytes"
         )
 
+    return await run_in_threadpool(_scan_bundle_payload, payload)
+
+
+def _scan_bundle_payload(payload: bytes) -> Verdict:
+    """Extract an uploaded bundle and scan it. Blocking — threadpool only."""
     tmp = tempfile.mkdtemp(prefix="skillcheck-bundle-")
     try:
         extract_dir = Path(tmp) / "skill"
