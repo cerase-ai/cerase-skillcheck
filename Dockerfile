@@ -27,8 +27,17 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # ---- runtime ---------------------------------------------------------------
 FROM python:3.13.9-slim@sha256:326df678c20c78d465db501563f3492d17c42a4afe33a1f2bf5406a1d56b0e86
 
+# `tini` as PID 1, the same way cerase-core's control-plane and agent-slot
+# images do it. uvicorn does not reap: every health probe the daemon runs is a
+# child of PID 1, and eleven zombies were counted in a container that had been
+# up two hours. It belongs in the image rather than in a compose `init: true`
+# for the same reason the HEALTHCHECK does — the control-plane's on-demand
+# starter creates this container with `docker run` and carries nothing from any
+# compose file, so a setting written there reaches some containers and not the
+# ones the fleet actually runs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
@@ -62,4 +71,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import os,sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT','8000'), timeout=5).status==200 else 1)"
 
-ENTRYPOINT ["sh", "-c", "exec uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]
+ENTRYPOINT ["/usr/bin/tini", "--", "sh", "-c", "exec uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]
