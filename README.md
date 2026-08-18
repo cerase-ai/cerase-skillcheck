@@ -19,7 +19,7 @@ control-plane reaches it by hostname (`http://cerase-skillcheck:8000`).
 
 | Method | Path | Input | Purpose |
 |---|---|---|---|
-| `GET` | `/healthz` | — | Liveness + scanner version. |
+| `GET` | `/healthz` | — | Liveness + scanner version + how many scans are running. |
 | `POST` | `/scan` | JSON `{path}` or `{skill_md}` | Scan a mounted skill dir / `.md`, or raw `SKILL.md` content. |
 | `POST` | `/scan/bundle` | multipart `.zip` | Scan an uploaded skill bundle (full directory scan). |
 
@@ -99,6 +99,8 @@ to the sub-processor / egress doc.)
 | `PORT` | `8000` | Listen port. |
 | `SKILLCHECK_SCAN_TIMEOUT` | `180` | Static-scan subprocess timeout (seconds). |
 | `SKILLCHECK_LLM_SCAN_TIMEOUT` | `300` | LLM-scan subprocess timeout (seconds). |
+| `SKILLCHECK_SCAN_DEADLINE` | `420` | Wall-clock ceiling for ONE request, covering the LLM attempt, the static fallback, and any wait for a scan slot. Without it the two step timeouts above simply add up. |
+| `SKILLCHECK_MAX_CONCURRENT_SCANS` | `2` | skillspector subprocesses allowed at once. Further requests wait for a slot inside their own deadline. |
 | `SKILLCHECK_MAX_UPLOAD` | `26214400` | Max `.zip` bundle upload size (bytes). |
 | `LITELLM_BASE_URL` | _(unset)_ | Our LiteLLM base (e.g. `http://cerase-litellm:4000`). Set **with** the key to enable LLM mode. |
 | `SKILLCHECK_LLM_API_KEY` | _(unset)_ | LiteLLM **service** virtual key (`cerase-svc-skillcheck`). Never the master key. Set **with** the base URL to enable LLM mode. |
@@ -108,6 +110,22 @@ to the sub-processor / egress doc.)
 LLM mode is **off** unless both `LITELLM_BASE_URL` and `SKILLCHECK_LLM_API_KEY`
 are set; with neither the service is static-only and identical to the M1 build.
 `GET /healthz` reports `llm_configured` + the active `llm_model`.
+
+## Liveness while busy
+
+A scan is a blocking subprocess that runs for minutes. Every scan therefore runs
+in the threadpool, and `/healthz` is an async handler that touches nothing but
+memory, so it is answered on the event loop while scans are in flight. It
+reports `scans_in_flight`, `busy` and `oldest_scan_seconds`, which is what lets
+a caller tell a working scanner from a stuck one.
+
+This is not a refinement. `POST /scan/bundle` used to call the scan directly
+from an async handler, which held uvicorn's only event loop for the whole scan.
+Measured against the live service: one real bundle scan ran 237 seconds and
+across those 237 seconds nineteen consecutive `/healthz` probes hit their 10s
+ceiling and returned nothing, so the container was marked unhealthy while the
+scan it was running returned HTTP 200. `tests/test_liveness.py` holds both
+halves of the fix and fails when either is reverted.
 
 ## Run shape
 
@@ -133,6 +151,15 @@ are set; with neither the service is static-only and identical to the M1 build.
 
   ```
   SKILLCHECK_URL=http://127.0.0.1:8000 python -m pytest tests/test_scan.py -v
+  ```
+
+- `tests/test_liveness.py` (pytest) drives the ASGI app with two concurrent
+  requests and requires the health probe to finish before the scan, and walks
+  the AST to refuse any `async def` that calls a blocking function directly — no
+  running service needed:
+
+  ```
+  python -m pytest tests/test_liveness.py -v
   ```
 
 ## Licensing
