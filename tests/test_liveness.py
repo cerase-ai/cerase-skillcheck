@@ -276,11 +276,13 @@ def test_the_probe_carries_its_own_timeout():
 
 
 def test_pid_one_is_an_init():
-    """uvicorn does not reap, and every health probe is a child of PID 1.
+    """A process the daemon execs in is reparented to PID 1, which must reap it.
 
-    Eleven zombies were counted in a container that had been up two hours, and
-    the count only goes one way. In the image rather than a compose `init: true`
-    for the same reason as the healthcheck above.
+    uvicorn reaps only when its event loop runs, so a blocked loop accumulates
+    them: eleven zombies were counted in a container whose loop a scan was
+    holding, and zero in the same container once it was free. In the image
+    rather than a compose `init: true`, for the same reason as the healthcheck
+    above.
     """
     text = DOCKERFILE.read_text(encoding="utf-8")
     entrypoint = re.search(r"^ENTRYPOINT .*$", text, re.M)

@@ -28,13 +28,20 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 FROM python:3.13.9-slim@sha256:326df678c20c78d465db501563f3492d17c42a4afe33a1f2bf5406a1d56b0e86
 
 # `tini` as PID 1, the same way cerase-core's control-plane and agent-slot
-# images do it. uvicorn does not reap: every health probe the daemon runs is a
-# child of PID 1, and eleven zombies were counted in a container that had been
-# up two hours. It belongs in the image rather than in a compose `init: true`
-# for the same reason the HEALTHCHECK does — the control-plane's on-demand
-# starter creates this container with `docker run` and carries nothing from any
-# compose file, so a setting written there reaches some containers and not the
-# ones the fleet actually runs.
+# images do it.
+#
+# A process the daemon execs into this container is reparented to PID 1 when it
+# ends, so PID 1 has to reap it, and uvicorn only does so when its event loop
+# gets to run. Eleven zombies were counted in a container whose loop had been
+# held by a scan; with the loop free the same container sits at zero, so this is
+# insurance against the loop being blocked again rather than a leak that is
+# live today.
+#
+# It belongs in the image rather than in a compose `init: true` for the same
+# reason the HEALTHCHECK does — the control-plane's on-demand starter creates
+# this container with `docker run` and carries nothing from any compose file, so
+# a setting written there reaches some containers and not the ones the fleet
+# actually runs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tini \
