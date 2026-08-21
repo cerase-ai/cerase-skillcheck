@@ -157,6 +157,15 @@ halves of the fix and fails when either is reverted.
 
 ## Tests
 
+Every file below runs in CI on each push and pull request, split by what it
+needs. The `tests` job runs the three offline files against pip wheels only
+(`fastapi`, `pydantic`, `python-multipart`, `httpx`, `pytest` — no skillspector
+install), and the `live-scan` job builds the image and runs
+`tests/test_scan.py` against the running container. `build-and-push` waits on
+both, so a failing test stops the publish. The offline job excludes
+`tests/test_scan.py` by name rather than listing the files to run, so a new
+offline file is picked up without editing the workflow.
+
 - `tests/test_helpers.py` (pytest) unit-tests the pure routing/degrade helpers
   (mode-flag mapping, degrade-to-static, the model-alias knob, base-URL
   normalisation) — no running service, no skillspector install needed:

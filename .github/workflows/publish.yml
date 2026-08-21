@@ -6,6 +6,12 @@ name: Build & publish Docker image
 #   - push of a `v*` git tag → vX.Y.Z, X.Y, latest
 #   - pull_request           → build-only validation, no push
 #   - workflow_dispatch      → manual trigger from the Actions UI
+#
+# Every test in tests/ runs before anything is published, split by what each
+# one needs: `tests` runs the files that need nothing but pip wheels, and
+# `live-scan` runs the one file that needs a running service, against a
+# container it builds. `build-and-push` needs both test jobs, so a failing test
+# stops the publish.
 
 on:
   push:
@@ -58,8 +64,122 @@ jobs:
           fi
           echo "OK: HEALTHCHECK present"
 
+  # The files in tests/ that run without a container. They need five pip wheels
+  # and finish in about ten seconds, so this runs on every push and pull request
+  # rather than only ahead of a release.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # The runtime image pins python:3.13.x, so an interpreter-version
+          # failure surfaces here instead of after the image is published.
+          python-version: '3.13'
+
+      # Deliberately NOT `pip install -r requirements.txt`. That file pins
+      # skillspector to a git commit and drags in langgraph / langchain /
+      # yara-python, minutes of install for a tree these tests never import:
+      # server.py shells the scanner out as a subprocess, and
+      # test_llm_degrade.py puts a stand-in scanner first on PATH.
+      #
+      # python-multipart is in the list although no test imports it. FastAPI
+      # raises at route-registration time for the UploadFile endpoint when it
+      # is missing, so `import server` fails and all three files error during
+      # collection. Removing it as unused turns the whole job red.
+      #
+      # uvicorn is deliberately absent: nothing under test imports it, the ASGI
+      # app is driven through httpx.ASGITransport. The image installs it from
+      # requirements.txt and the entrypoint proves it there.
+      - name: Install the offline test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'fastapi>=0.115,<1.0' pydantic 'python-multipart>=0.0.9' httpx pytest
+
+      # Exclude the one live file by name rather than listing the offline files
+      # to include. A fourth offline test file added later then runs here on the
+      # day it is written, instead of being silently skipped until someone
+      # remembers this workflow exists.
+      - name: Run the offline suite
+        run: python -m pytest tests --ignore=tests/test_scan.py -v
+
+  # tests/test_scan.py drives the service over HTTP and carries no skip guard,
+  # so it can only run against a container. This job builds the image and runs
+  # it, rather than giving the file a skip guard: a tier that skips when the
+  # service is absent passes on days it checked nothing.
+  live-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # This job is an HTTP client of the container. It needs neither fastapi
+      # nor the app's own dependencies.
+      - name: Install the test client
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx pytest
+
+      # Same cache scope as the publish build, read-only. build-and-push is the
+      # single writer of that scope, so the two never race on one cache key;
+      # this job reads what the previous run wrote. The cost is one cold build
+      # here on the first run after requirements.txt changes.
+      - name: Build the image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:ci
+          cache-from: type=gha,scope=${{ env.IMAGE }}
+          provenance: false
+
+      # No LiteLLM variables, so this container is static-only and the suite
+      # asserts mode: static / degraded: false through /healthz.
+      - name: Start the container
+        run: docker run -d --name skillcheck-ci -p 8000:8000 ${{ env.IMAGE }}:ci
+
+      # Poll rather than sleep on the image's 40s HEALTHCHECK start-period: the
+      # service answers in a couple of seconds and the fixed wait would be spent
+      # every run.
+      - name: Wait for /healthz
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+              curl -sS http://127.0.0.1:8000/healthz; echo
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::service never answered /healthz within 120s"
+          exit 1
+
+      - name: Run the live scan suite
+        env:
+          SKILLCHECK_URL: http://127.0.0.1:8000
+        run: python -m pytest tests/test_scan.py -v
+
+      # When this job fails the reason is usually a traceback inside the
+      # container, which the pytest assertion cannot show.
+      - name: Container logs
+        if: failure()
+        run: docker logs skillcheck-ci
+
   build-and-push:
-    needs: [hygiene]
+    needs: [hygiene, tests, live-scan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
