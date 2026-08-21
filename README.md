@@ -68,8 +68,29 @@ is our existing routing/metering — **no new sub-processor**. The service key i
 `/health/liveliness`; if unreachable it runs static-only and flags
 `degraded: true`. If LiteLLM is reachable but the LLM stage fails at runtime
 (bad key, timeout, every call erroring), the verdict is likewise mapped to
-`mode: static` / `degraded: true` from skillspector's own report metadata
-(`meta_analysis_applied`). Either way a well-formed verdict is returned.
+`mode: static` / `degraded: true`. Either way a well-formed verdict is
+returned.
+
+**A requested LLM stage that produced no completion is degraded, whatever
+stopped it.** The service routes the scanner's model calls through a loopback
+forwarder on `127.0.0.1` that relays each request to LiteLLM unchanged
+(`Authorization` included), returns the answer verbatim, and counts the
+responses that carried output. Zero of them means the semantic analyzers saw
+nothing, so the verdict is `mode: static` / `degraded: true` — the same
+treatment a timeout gets. A rejected key, a rate limit, a refused connection
+and a `200` with an empty `choices` array are one fact to a caller.
+
+The count is needed because the report cannot carry that fact. skillspector
+marks a scan degraded only when its `llm_call_log` holds no successful record,
+and three of its four LLM nodes (`meta_analyzer`, `semantic_developer_intent`,
+`semantic_quality_policy`) run their batches through
+`LLMAnalyzerBase.arun_batches`, which drops a failed batch and returns the
+survivors — so a node whose every call was rejected records a *successful* call
+and `meta_analysis_applied` stays `true`. Measured with a key the router
+rejects: every call 401s in under a second, a bundle finishes in 2.4 s instead
+of 187 s, and the verdict read `SAFE / LOW / 0` with no findings and
+`degraded: false`. `tests/test_llm_degrade.py` drives that path and fails when
+the counting is removed.
 
 ## How skillspector is invoked
 
@@ -151,6 +172,16 @@ halves of the fix and fails when either is reverted.
 
   ```
   SKILLCHECK_URL=http://127.0.0.1:8000 python -m pytest tests/test_scan.py -v
+  ```
+
+- `tests/test_llm_degrade.py` (pytest) drives a scan against a stand-in router
+  and a stand-in scanner: every rejection shape (401 / 429 / 500 / a `200` with
+  no completion) must come back `mode: static` / `degraded: true`, a healthy
+  router must keep `mode: llm`, and the service key must still reach the router
+  through the forwarder. No running service and no skillspector install needed:
+
+  ```
+  python -m pytest tests/test_llm_degrade.py -v
   ```
 
 - `tests/test_liveness.py` (pytest) drives the ASGI app with two concurrent

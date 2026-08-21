@@ -122,30 +122,32 @@ def test_base_scan_env_strips_ambient_openai_creds(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Mode / degraded mapping from a skillspector report's metadata
-# (the crux of M-SKILLSCAN-2: mode flag + degrade)
+# Mode / degraded mapping from a skillspector report's metadata plus the number
+# of completions the scan observed (the crux of M-SKILLSCAN-2: mode + degrade).
+# The count is what makes a rejected credential degrade rather than read clean;
+# tests/test_llm_degrade.py drives it end to end.
 # ---------------------------------------------------------------------------
 
 
-def test_llm_outcome_applied_is_llm_not_degraded():
+def test_llm_outcome_applied_with_completions_is_llm_not_degraded():
     data = {"metadata": {"llm_requested": True, "meta_analysis_applied": True}}
-    assert server._llm_outcome(data) == (server.MODE_LLM, False)
+    assert server._llm_outcome(data, completions=2) == (server.MODE_LLM, False)
 
 
 def test_llm_outcome_requested_but_not_applied_is_static_degraded():
     # LLM was asked for but did not effectively run (unreachable / bad key /
     # every call failed) — the report reflects static analysis only.
     data = {"metadata": {"llm_requested": True, "meta_analysis_applied": False, "llm_degraded": True}}
-    assert server._llm_outcome(data) == (server.MODE_STATIC, True)
+    assert server._llm_outcome(data, completions=0) == (server.MODE_STATIC, True)
 
 
 def test_llm_outcome_not_requested_is_static_not_degraded():
     data = {"metadata": {"llm_requested": False, "meta_analysis_applied": False}}
-    assert server._llm_outcome(data) == (server.MODE_STATIC, False)
+    assert server._llm_outcome(data, completions=0) == (server.MODE_STATIC, False)
 
 
 def test_llm_outcome_missing_metadata_defaults_to_static():
-    assert server._llm_outcome({}) == (server.MODE_STATIC, False)
+    assert server._llm_outcome({}, completions=0) == (server.MODE_STATIC, False)
 
 
 # ---------------------------------------------------------------------------

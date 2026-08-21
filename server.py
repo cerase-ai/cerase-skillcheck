@@ -27,6 +27,21 @@ Analysis modes (M-SKILLSCAN-2)
   is unreachable, misconfigured, or the LLM stage fails at runtime, the scan
   still returns a *static* verdict flagged `degraded: true` instead of erroring.
 
+  **What counts as an LLM pass is measured, not read off the report.** The
+  scanner's own `meta_analysis_applied` cannot carry this fact: three of its
+  four LLM nodes run their batches through `LLMAnalyzerBase.arun_batches`,
+  which drops a failed batch and returns the survivors, so a node whose every
+  call was rejected still records a successful LLM call and the report claims
+  an applied LLM pass. Measured with a key the router rejects: every call 401s,
+  a bundle finishes in 2.4s instead of 187s, and the verdict was `SAFE / LOW /
+  0` with `degraded: false`. So the LLM traffic is routed through a loopback
+  forwarder (`_CompletionProxy`) that counts the responses actually carrying
+  output; a stage that was requested and produced none is `static` +
+  `degraded: true`, exactly like one that ran out of time. The count is the
+  discriminator, never the reason for the failure — a rejected key, a rate
+  limit, a refused connection and a 200 with an empty `choices` array are all
+  the same fact to a caller.
+
 Endpoints
   GET  /healthz        liveness + scanner version + LLM configuration + how many
                        scans are running right now.
@@ -109,6 +124,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -250,6 +266,19 @@ def _llm_configured() -> bool:
     return bool(_litellm_base_url()) and bool(_llm_api_key())
 
 
+def _litellm_root() -> str:
+    """``LITELLM_BASE_URL`` without a trailing slash or ``/v1`` suffix.
+
+    The variable is set both ways in the fleet. The scanner's endpoint, the
+    liveness probe and the proxy's upstream are all built from this one root, so
+    none of them can be pointed at ``/v1/v1`` or at ``/v1/health/liveliness``.
+    """
+    base = _litellm_base_url().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base
+
+
 def _openai_base_url() -> str:
     """The OpenAI-compatible endpoint skillspector should call.
 
@@ -258,18 +287,12 @@ def _openai_base_url() -> str:
     normalise ``LITELLM_BASE_URL`` (the routing root, matching cerase-search's
     convention) into that shape.
     """
-    base = _litellm_base_url().rstrip("/")
-    if base.endswith("/v1"):
-        return base
-    return base + "/v1"
+    return _litellm_root() + "/v1"
 
 
 def _litellm_health_url() -> str:
     """LiteLLM's unauthenticated liveness endpoint (not under /v1)."""
-    base = _litellm_base_url().rstrip("/")
-    if base.endswith("/v1"):
-        base = base[: -len("/v1")]
-    return base + "/health/liveliness"
+    return _litellm_root() + "/health/liveliness"
 
 
 def _base_scan_env() -> dict[str, str]:
@@ -288,18 +311,23 @@ def _base_scan_env() -> dict[str, str]:
     return env
 
 
-def _llm_scan_env() -> dict[str, str]:
+def _llm_scan_env(base_url: str | None = None) -> dict[str, str]:
     """Environment that points skillspector's OpenAI provider at our LiteLLM.
 
     Selects the OpenAI provider explicitly, supplies the service virtual key and
     our LiteLLM base_url, and pins every analyzer slot to the configured model
     alias (``SKILLSPECTOR_MODEL`` flows through ``constants.MODEL_CONFIG`` to
     all slots). NOT the master key, NOT CERASE_LLM_API_BASE.
+
+    *base_url* overrides the endpoint the scanner calls. A scan passes the
+    loopback address of its :class:`_CompletionProxy` there, which forwards to
+    the same LiteLLM and counts what comes back; with it omitted the scanner
+    talks to LiteLLM directly and nothing observes the completions.
     """
     env = _base_scan_env()
     env["SKILLSPECTOR_PROVIDER"] = "openai"
     env["OPENAI_API_KEY"] = _llm_api_key()
-    env["OPENAI_BASE_URL"] = _openai_base_url()
+    env["OPENAI_BASE_URL"] = base_url or _openai_base_url()
     env["SKILLSPECTOR_MODEL"] = _llm_model()
     return env
 
@@ -322,6 +350,224 @@ def _litellm_reachable() -> bool:
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.warning("LiteLLM probe failed (%s): %s — degrading to static", url, exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Counting the completions an LLM scan actually got back
+# ---------------------------------------------------------------------------
+
+# Hop-by-hop headers belong to one connection and must not be relayed onto the
+# next; Host and Content-Length are rebuilt for the forwarded request.
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+# Endpoints whose answer IS the model's work. Everything else a client may call
+# (model listings, health) is forwarded but never counted, so a scan cannot look
+# like it got a completion because its client listed the models first.
+_COMPLETION_PATHS = ("/chat/completions", "/completions", "/responses", "/messages")
+
+
+def _choice_carries_output(choice: Any) -> bool:
+    """Whether one element of ``choices`` holds text or a tool call."""
+    if not isinstance(choice, dict):
+        return False
+    message = choice.get("message")
+    if isinstance(message, dict) and (
+        message.get("content") or message.get("tool_calls") or message.get("function_call")
+    ):
+        return True
+    delta = choice.get("delta")
+    if isinstance(delta, dict) and (delta.get("content") or delta.get("tool_calls")):
+        return True
+    return bool(choice.get("text"))
+
+
+def _is_usable_completion(status: int, payload: bytes) -> bool:
+    """Whether one model response carried output the analysis could use.
+
+    A rejected key, a rate limit, a router error, an empty body and a 200 whose
+    ``choices`` array is empty are one fact here: the analyzer that asked got
+    nothing back. What produced the emptiness is the scanner's business, not the
+    verdict's.
+    """
+    if not (200 <= status < 300) or not payload.strip():
+        return False
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # A 2xx body that is not JSON is a stream of tokens, which is output.
+        return True
+    if not isinstance(data, dict) or data.get("error"):
+        return False
+    choices = data.get("choices")
+    if choices is None:
+        # An OpenAI-compatible endpoint of another shape answered 2xx with a
+        # body; nothing here can prove it empty, so it counts.
+        return True
+    if not isinstance(choices, list) or not choices:
+        return False
+    return any(_choice_carries_output(c) for c in choices)
+
+
+class _CompletionProxy:
+    """Loopback forwarder between the scanner and LiteLLM that counts answers.
+
+    The scan runs as a subprocess, so the only place the engine can see whether
+    the LLM stage produced anything is the connection it opens. The proxy binds
+    an ephemeral port on 127.0.0.1, relays every request to LiteLLM unchanged
+    (Authorization included) and returns the answer verbatim, so the scanner
+    behaves exactly as it does against the router itself. What it adds is the
+    count of responses that carried output.
+
+    It never logs a request body or a header: those hold the prompts and the
+    service key.
+    """
+
+    def __init__(self, upstream: str, budget: Budget) -> None:
+        self._upstream = upstream.rstrip("/")
+        self._budget = budget
+        self._lock = threading.Lock()
+        self._attempted = 0
+        self._usable = 0
+        self._httpd: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    # -- counters -----------------------------------------------------------
+
+    def _record(self, usable: bool) -> None:
+        with self._lock:
+            self._attempted += 1
+            if usable:
+                self._usable += 1
+
+    @property
+    def attempted_completions(self) -> int:
+        with self._lock:
+            return self._attempted
+
+    @property
+    def usable_completions(self) -> int:
+        with self._lock:
+            return self._usable
+
+    # -- lifecycle ----------------------------------------------------------
+
+    @property
+    def base_url(self) -> str:
+        """The value to hand the scanner as ``OPENAI_BASE_URL``."""
+        if self._httpd is None:
+            raise RuntimeError("completion proxy is not running")
+        host, port = self._httpd.server_address[:2]
+        return f"http://{host}:{port}/v1"
+
+    def start(self) -> None:
+        """Bind and serve. Raises OSError when no port can be opened."""
+        proxy = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+                proxy._forward(self, "GET")
+
+            def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+                proxy._forward(self, "POST")
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._httpd.daemon_threads = True
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, name="skillcheck-llm-proxy", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop serving. Safe to call twice; the counts stay readable after."""
+        if self._httpd is None:
+            return
+        httpd, self._httpd = self._httpd, None
+        httpd.shutdown()
+        httpd.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            self._thread = None
+
+    # -- forwarding ---------------------------------------------------------
+
+    def _timeout(self) -> float:
+        return max(1.0, min(float(_LLM_SCAN_TIMEOUT), self._budget.remaining()))
+
+    def _forward(self, handler: BaseHTTPRequestHandler, method: str) -> None:
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length > 0 else b""
+        headers = {
+            key: value
+            for key, value in handler.headers.items()
+            if key.lower() not in _HOP_BY_HOP_HEADERS and key.lower() != "accept-encoding"
+        }
+        # The scanner's HTTP client asks for gzip, and urlopen hands back the
+        # compressed bytes. Relaying those without their Content-Encoding would
+        # give the client a body it cannot read and give the count below a body
+        # it cannot parse, so the forwarded request asks for none.
+        headers["Accept-Encoding"] = "identity"
+        request = urllib.request.Request(  # noqa: S310 (internal host)
+            self._upstream + handler.path,
+            data=body if method == "POST" else None,
+            headers=headers,
+            method=method,
+        )
+        content_type = "application/json"
+        content_encoding = None
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout()) as resp:
+                status = resp.status
+                payload = resp.read()
+                content_type = resp.headers.get("Content-Type", content_type)
+                content_encoding = resp.headers.get("Content-Encoding")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            payload = exc.read()
+            if exc.headers is not None:
+                content_type = exc.headers.get("Content-Type", content_type)
+                content_encoding = exc.headers.get("Content-Encoding")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # The router never answered. The scanner is told in the shape its
+            # client understands, and the call counts as producing nothing.
+            status = 502
+            payload = json.dumps(
+                {"error": {"message": f"LiteLLM did not answer: {exc}", "type": "upstream_error"}}
+            ).encode("utf-8")
+
+        # Matched without the query string, so a client that appends one (an
+        # api-version, a deployment) is still counted and its scan is not
+        # degraded for a call it did make.
+        if handler.path.split("?", 1)[0].endswith(_COMPLETION_PATHS):
+            self._record(_is_usable_completion(status, payload))
+
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
+        # Kept only for a router that compresses anyway: the body relayed below
+        # is byte-for-byte what came back, so the client must be told how to
+        # read it.
+        if content_encoding and content_encoding.lower() != "identity":
+            handler.send_header("Content-Encoding", content_encoding)
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +633,14 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
             proc.kill()
 
 
-def _run_skillspector(target: Path, *, use_llm: bool, budget: Budget) -> dict[str, Any]:
+def _run_skillspector(
+    target: Path, *, use_llm: bool, budget: Budget, llm_base_url: str | None = None
+) -> dict[str, Any]:
     """Run skillspector on *target* and return its parsed JSON report.
 
     ``use_llm=False`` passes ``--no-llm`` (static-only). ``use_llm=True`` runs
-    the full analysis with skillspector's OpenAI provider pointed at our
+    the full analysis with skillspector's OpenAI provider pointed at
+    *llm_base_url* (the scan's completion proxy) or, absent one, straight at our
     LiteLLM. The step timeout is the smaller of its own ceiling and what is left
     of the request's *budget*. Raises :class:`ScanError` when no report is
     produced.
@@ -399,7 +648,7 @@ def _run_skillspector(target: Path, *, use_llm: bool, budget: Budget) -> dict[st
     ALWAYS runs on a worker thread, never on the event loop — see the module
     docstring. It blocks for as long as the scan takes.
     """
-    env = _llm_scan_env() if use_llm else _base_scan_env()
+    env = _llm_scan_env(llm_base_url) if use_llm else _base_scan_env()
     step = float(_LLM_SCAN_TIMEOUT if use_llm else _SCAN_TIMEOUT)
     timeout = min(step, budget.remaining())
     if timeout <= 0:
@@ -444,23 +693,33 @@ def _run_skillspector(target: Path, *, use_llm: bool, budget: Budget) -> dict[st
             raise ScanError(f"could not parse skillspector report: {exc}") from exc
 
 
-def _llm_outcome(data: dict[str, Any]) -> tuple[str, bool]:
-    """Derive ``(mode, degraded)`` from a skillspector report's metadata.
+def _llm_outcome(data: dict[str, Any], *, completions: int) -> tuple[str, bool]:
+    """Derive ``(mode, degraded)`` from the report AND the completions observed.
 
-    skillspector records LLM runtime truth in ``metadata``:
-      - ``llm_requested``        the LLM stage was asked for (not --no-llm).
-      - ``meta_analysis_applied``the LLM stage effectively ran (requested,
-                                 available, and not fully degraded).
-    When the LLM was requested but did not effectively run — LiteLLM
-    unreachable, bad key, or every call failing at runtime — the report already
-    reflects static analysis only, so we label it ``static`` + ``degraded``.
+    Two independent sources, and either one alone can degrade the verdict:
+
+      - the report's ``metadata`` — ``llm_requested`` (the stage was asked for,
+        i.e. not --no-llm) and ``meta_analysis_applied`` (skillspector's own
+        account of whether it ran);
+      - *completions*, how many model responses carried output back through the
+        scan's :class:`_CompletionProxy`.
+
+    The second exists because the first can claim a pass that never happened:
+    skillspector's LLM nodes drop a failed batch and still record a successful
+    call, so a scan whose every request was rejected reports
+    ``meta_analysis_applied: true``. A stage that was requested and produced no
+    completion is therefore ``static`` + ``degraded``, on the same footing as
+    one killed by a timeout — the count decides, not the reason it is zero.
+
+    *completions* is required rather than defaulted so no caller can fall back
+    to trusting the metadata by omission.
     """
     meta = data.get("metadata") or {}
     requested = bool(meta.get("llm_requested"))
     applied = bool(meta.get("meta_analysis_applied"))
     if not requested:
         return MODE_STATIC, False
-    if applied:
+    if applied and completions > 0:
         return MODE_LLM, False
     return MODE_STATIC, True
 
@@ -518,11 +777,14 @@ def _scan_target(target: Path, *, partial: bool) -> Verdict:
       1. LLM not configured        → static scan, mode=static.
       2. LLM configured, LiteLLM
          unreachable               → static scan, mode=static, degraded=true.
-      3. LLM configured + reachable → LLM scan; map mode/degraded from the
-         report metadata (a runtime LLM failure still yields a static verdict
-         flagged degraded).
+      3. LLM configured + reachable → LLM scan through the completion proxy;
+         mode/degraded come from the report metadata AND the number of
+         completions the proxy saw, so a stage that answered nothing is a
+         static verdict flagged degraded.
       4. LLM scan raises (exit 2 /
-         timeout / no report)      → static fallback, mode=static, degraded=true.
+         timeout / no report), or
+         the proxy cannot bind      → static fallback, mode=static,
+                                      degraded=true.
 
     The whole sequence runs inside ONE budget and holds ONE scan slot, so a
     request cannot outlive ``SKILLCHECK_SCAN_DEADLINE`` however many steps it
@@ -538,8 +800,23 @@ def _scan_target(target: Path, *, partial: bool) -> Verdict:
             data = _run_skillspector(target, use_llm=False, budget=budget)
             return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
 
+        proxy = _CompletionProxy(_litellm_root(), budget)
         try:
-            data = _run_skillspector(target, use_llm=True, budget=budget)
+            proxy.start()
+        except OSError as exc:
+            # Nothing would be watching the LLM traffic, and an unwatched LLM
+            # scan cannot be told apart from one that answered nothing.
+            logger.warning("completion proxy did not start (%s) — scanning static", exc)
+            data = _run_skillspector(target, use_llm=False, budget=budget)
+            return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
+
+        try:
+            try:
+                data = _run_skillspector(
+                    target, use_llm=True, budget=budget, llm_base_url=proxy.base_url
+                )
+            finally:
+                proxy.stop()
         except ScanError as exc:
             # LLM run aborted (e.g. graph-level misconfig) — never block the
             # scan; fall back to a static run on whatever budget is left and
@@ -548,7 +825,14 @@ def _scan_target(target: Path, *, partial: bool) -> Verdict:
             data = _run_skillspector(target, use_llm=False, budget=budget)
             return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
 
-        mode, degraded = _llm_outcome(data)
+        completions = proxy.usable_completions
+        if completions == 0:
+            logger.warning(
+                "LLM stage produced no usable completion in %d call(s) — verdict is "
+                "static and degraded",
+                proxy.attempted_completions,
+            )
+        mode, degraded = _llm_outcome(data, completions=completions)
         return _to_verdict(data, partial=partial, mode=mode, degraded=degraded)
 
 
