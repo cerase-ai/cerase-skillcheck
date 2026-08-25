@@ -426,10 +426,11 @@ class _CompletionProxy:
 
     The scan runs as a subprocess, so the only place the engine can see whether
     the LLM stage produced anything is the connection it opens. The proxy binds
-    an ephemeral port on 127.0.0.1, relays every request to LiteLLM unchanged
-    (Authorization included) and returns the answer verbatim, so the scanner
+    an ephemeral port on 127.0.0.1, relays every request to LiteLLM with the
+    Authorization header untouched and returns the answer verbatim, so the scanner
     behaves exactly as it does against the router itself. What it adds is the
-    count of responses that carried output.
+    count of responses that carried output, and one declared header naming
+    these completions as a scan.
 
     It never logs a request body or a header: those hold the prompts and the
     service key.
@@ -524,6 +525,16 @@ class _CompletionProxy:
         # give the client a body it cannot read and give the count below a body
         # it cannot parse, so the forwarded request asks for none.
         headers["Accept-Encoding"] = "identity"
+        # Declare what these completions ARE, so the platform's spend report
+        # does not count a security scan as somebody's conversation. Measured
+        # over three days before this line: 88 of the 158 calls the report
+        # labelled `turn` were scans, carrying $1,74 of the $1,91 that label
+        # held. The scanner is a third-party library with no header hook of its
+        # own, and this proxy is the one place every completion passes through.
+        #
+        # Overwritten rather than defaulted: the value is ours to state, and a
+        # scanner that ever set its own must not be able to relabel our spend.
+        headers["x-cerase-call-type"] = "scan"
         request = urllib.request.Request(  # noqa: S310 (internal host)
             self._upstream + handler.path,
             data=body if method == "POST" else None,
