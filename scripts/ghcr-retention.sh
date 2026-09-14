@@ -3,11 +3,23 @@
 # Prune the GHCR container versions of ONE package, keeping the newest KEEP
 # tagged ones and everything a protected tag rides on.
 #
-# Reads three variables from the environment and nothing else:
-#   PACKAGE  the container package name, without the org prefix
-#   KEEP     how many unprotected tagged versions survive
-#   GH_TOKEN a token with packages:write, and Admin on the package to delete
+# Reads these variables from the environment and nothing else:
+#   PACKAGE          the container package name, without the org prefix
+#   KEEP             how many unprotected tagged versions survive
+#   GH_TOKEN         a token with packages:write, and Admin on the package to delete
+#   RELEASE_TAGS_URL where the Fleet Console lists the tags its releases pin,
+#                    defaulting to the console's own address
 # GITHUB_REPOSITORY_OWNER and GITHUB_REPOSITORY come from the runner.
+#
+# A tag a release pins is protected like latest and main. The newest KEEP tagged
+# versions are a few days of history for an image that gains one on most
+# pushes, and a release is cut, tried on the canary and the early ring, and
+# promoted days later; a rollback promotes one from the week before. Pruned by
+# age, its tags are gone by the time a box is told to pull them. The console
+# holds the releases and publishes those tags, so reading them needs no
+# credential. An answer that cannot be read stops the run before a single
+# version is listed: pruning as if no release pinned anything is the one
+# outcome worse than not pruning.
 #
 # This calls the GHCR API directly instead of using
 # actions/delete-package-versions, and the reason is a defect that was live in
@@ -41,6 +53,7 @@ set -euo pipefail
 : "${GITHUB_REPOSITORY_OWNER:?GITHUB_REPOSITORY_OWNER is required — the org that owns the package}"
 
 ORG="$GITHUB_REPOSITORY_OWNER"
+RELEASE_TAGS_URL="${RELEASE_TAGS_URL:-https://dash.cerase.ai/api/v1/releases/tags}"
 ORG_PATH="/orgs/$ORG/packages/container/$PACKAGE"
 USER_PATH="/users/$ORG/packages/container/$PACKAGE"
 WORK="${RUNNER_TEMP:-/tmp}"
@@ -93,6 +106,31 @@ delete_version() {
   return 1
 }
 
+# The tags the console's releases pin for this package, as a JSON array.
+#
+# The shape is checked whole before any of it is used: an object under `images`
+# whose every value is a list of sha tags. A maintenance page, a proxy's error
+# body, or a list keyed by something else is an answer this run cannot read,
+# and it says so instead of treating it as a list with nothing in it. curl's own
+# retry covers the transient failures a console restart produces.
+read_release_tags() {
+  local out="$1"
+  if ! curl -fsS --retry 2 --retry-delay 5 --max-time 20 -H 'Accept: application/json' \
+      "$RELEASE_TAGS_URL" >"$WORK/release-tags.json" 2>"$WORK/err"; then
+    cat "$WORK/err" >&2
+    return 1
+  fi
+  jq -e '
+    (.images | type == "object")
+    and ([.images[] | type == "array"] | all)
+    and ([.images[][] | type == "string" and test("^sha-[0-9a-f]{7,40}$")] | all)
+  ' "$WORK/release-tags.json" >/dev/null 2>&1 || {
+    echo "the answer is not a map of images to lists of sha tags" >&2
+    return 1
+  }
+  jq -c --arg package "$PACKAGE" '.images[$package] // []' "$WORK/release-tags.json" >"$out"
+}
+
 # Selection, and the whole point of writing it out rather than passing a
 # pattern to an action: a version is protected by its TAGS. Untagged versions
 # go first because these images are one platform with provenance off, so an
@@ -100,7 +138,8 @@ delete_version() {
 cat >"$WORK/select.jq" <<'JQ'
 [ .[]
   | { id, created_at, tags: (.metadata.container.tags // []) }
-  | . + { protected: (.tags | any(. == "latest" or . == "main" or test("^v[0-9]"))) }
+  | . + { protected: (.tags | any(. == "latest" or . == "main" or test("^v[0-9]")
+                                 or (. as $tag | $pinned | index([$tag]) != null))) }
 ]
 | ( map(select((.tags | length) == 0)) ) as $untagged
 | ( map(select((.tags | length) > 0 and (.protected | not)))
@@ -111,6 +150,13 @@ cat >"$WORK/select.jq" <<'JQ'
 | .[]
 | "\(.id) \(.created_at) \(if (.tags|length) == 0 then "-" else (.tags|join(",")) end)"
 JQ
+
+read_release_tags "$WORK/pinned.json" || {
+  echo "::error::cannot read the tags live releases pin from $RELEASE_TAGS_URL, so nothing of $PACKAGE is deleted"
+  exit 1
+}
+PINNED="$(cat "$WORK/pinned.json")"
+echo "live releases pin $(jq length "$WORK/pinned.json") tag(s) of $PACKAGE, read from $RELEASE_TAGS_URL"
 
 list_versions "$WORK/versions.json" || {
   echo "::error::cannot read the versions of $PACKAGE"
@@ -139,12 +185,16 @@ if [ -n "$RUNNING_IN" ] && [ "$LINKED" != "$RUNNING_IN" ]; then
   echo "note: if a delete below is refused, the missing Admin grant on the package is why"
 fi
 
-jq -r --argjson keep "$KEEP" -f "$WORK/select.jq" \
+jq -r --argjson keep "$KEEP" --argjson pinned "$PINNED" -f "$WORK/select.jq" \
   "$WORK/versions.json" >"$WORK/to-delete.txt"
 SELECTED="$(wc -l <"$WORK/to-delete.txt" | tr -d ' ')"
 
 jq -r '.[] | select((.metadata.container.tags // []) | any(. == "latest" or . == "main" or test("^v[0-9]")))
        | "kept, protected by tag: \(.id) \(.metadata.container.tags | join(","))"' \
+  "$WORK/versions.json"
+jq -r --argjson pinned "$PINNED" '.[]
+       | select((.metadata.container.tags // []) | any(. as $tag | $pinned | index([$tag]) != null))
+       | "kept, pinned by a release: \(.id) \(.metadata.container.tags | join(","))"' \
   "$WORK/versions.json"
 
 if [ "$SELECTED" -eq 0 ]; then
@@ -181,7 +231,7 @@ LEFT=""
 for attempt in 1 2 3; do
   sleep $((attempt * 5))
   list_versions "$WORK/after.json" || continue
-  LEFT="$(jq -r --argjson keep "$KEEP" -f "$WORK/select.jq" "$WORK/after.json" | wc -l | tr -d ' ')"
+  LEFT="$(jq -r --argjson keep "$KEEP" --argjson pinned "$PINNED" -f "$WORK/select.jq" "$WORK/after.json" | wc -l | tr -d ' ')"
   if [ "$LEFT" = "0" ]; then
     echo "$PACKAGE is at its floor: $(jq length "$WORK/after.json") versions remain"
     exit 0
