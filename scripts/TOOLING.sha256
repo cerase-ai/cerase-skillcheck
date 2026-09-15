@@ -1,4 +1,4 @@
 # Tooling vendored from cerase-core — DO NOT EDIT these files here.
 # Re-sync from cerase-core:  ./scripts/sync-tooling.sh
 # The first divergence between two copies is otherwise silent.
-40130a6aa5445c99b1e4e68aab1f25063cc87d1ffe55d1ab54191afe88f80cba  scripts/ghcr-retention.sh
+c9db74d10eff36d6d789a8c7696f623f319bc8c1878eeb4c980bb5bd18f0e203  scripts/ghcr-retention.sh

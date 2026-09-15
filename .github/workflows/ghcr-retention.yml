@@ -7,13 +7,22 @@ name: ghcr-retention
 # The pruning itself is `scripts/ghcr-retention.sh`, which cerase-core owns and
 # every repo with a retention workflow carries a byte-identical copy of. The copy
 # here is written by `scripts/sync-tooling.sh` in cerase-core and pinned by
-# `scripts/TOOLING.sha256`; the step below verifies the pin before running the
-# script, so an edited copy stops the run instead of pruning with it. Do not edit
-# the copy — the edit is what the pin exists to catch. Why the script calls the
-# GHCR API rather than actions/delete-package-versions is in its own header.
+# `scripts/TOOLING.sha256`, which `scripts/TOOLING.seal` pins in turn; each job
+# checks both before running the script, so an edited copy stops the run instead
+# of pruning with it. Do not edit the copy — the edit is what the pin exists to
+# catch. Why the script calls the GHCR API rather than
+# actions/delete-package-versions is in its own header.
 #
 # The floor is lower here than in cerase-core because this package gains one
 # version per push to one repo, not one per push to a repo that builds nine.
+#
+# A manual run can be a dry run: every read the prune makes, the plan it would
+# carry out with a reason per version, and no delete. It runs in its own job,
+# whose token can read packages and not delete them, so a defect in the
+# script's dry branch fails a request instead of deleting a version. Only the
+# prune job holds packages: write, and a dry run never starts it. Both hand the
+# script the input as GHCR_RETENTION_DRY_RUN, which is empty on the schedule,
+# so the weekly run always prunes.
 
 on:
   schedule:
@@ -21,18 +30,27 @@ on:
     # contend on the same registry at the same minute.
     - cron: '35 4 * * 1'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: List what would be kept and deleted, and delete nothing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  prune:
+  dry-run:
+    if: ${{ inputs.dry_run }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     env:
       PACKAGE: cerase-skillcheck
       KEEP: 10
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_RETENTION_DRY_RUN: ${{ inputs.dry_run }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,7 +61,31 @@ jobs:
         run: |
           set -euo pipefail
           grep -q 'scripts/ghcr-retention.sh' scripts/TOOLING.sha256
-          sha256sum --check scripts/TOOLING.sha256
+          sha256sum --check scripts/TOOLING.sha256 scripts/TOOLING.seal
+
+      - name: List what a prune of cerase-skillcheck would keep and delete
+        run: bash scripts/ghcr-retention.sh
+
+  prune:
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PACKAGE: cerase-skillcheck
+      KEEP: 10
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_RETENTION_DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify the vendored tooling against its pin
+        run: |
+          set -euo pipefail
+          grep -q 'scripts/ghcr-retention.sh' scripts/TOOLING.sha256
+          sha256sum --check scripts/TOOLING.sha256 scripts/TOOLING.seal
 
       - name: Prune GHCR versions of cerase-skillcheck to its retention floor
         run: bash scripts/ghcr-retention.sh

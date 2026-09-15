@@ -3,13 +3,25 @@
 # Prune the GHCR container versions of ONE package, keeping the newest KEEP
 # tagged ones and everything a protected tag rides on.
 #
+# Usage: ghcr-retention.sh [--dry-run]
+#
 # Reads these variables from the environment and nothing else:
 #   PACKAGE          the container package name, without the org prefix
 #   KEEP             how many unprotected tagged versions survive
 #   GH_TOKEN         a token with packages:write, and Admin on the package to delete
 #   RELEASE_TAGS_URL where the Fleet Console lists the tags its releases pin,
 #                    defaulting to the console's own address
+#   GHCR_RETENTION_DRY_RUN
+#                    1 or true for a dry run, the form a workflow input sets;
+#                    empty, 0 or false for a real one
 # GITHUB_REPOSITORY_OWNER and GITHUB_REPOSITORY come from the runner.
+#
+# A dry run makes every read a real run makes before its first delete, stops
+# where a real run stops when the release list cannot be read, prints the same
+# plan with a reason for every version, and exits before the first delete. A
+# read-only token is enough for it. A mode this script does not recognise, from
+# either the flag or the variable, is refused before anything is read: a
+# mistyped request for a dry run must not prune.
 #
 # A tag a release pins is protected like latest and main. The newest KEEP tagged
 # versions are a few days of history for an image that gains one on most
@@ -48,6 +60,24 @@
 
 set -euo pipefail
 
+DRY_RUN=""
+case "${GHCR_RETENTION_DRY_RUN:-}" in
+  ""|0|false) ;;
+  1|true) DRY_RUN=1 ;;
+  *)
+    echo "::error::GHCR_RETENTION_DRY_RUN is '$GHCR_RETENTION_DRY_RUN'; it takes 1 or true for a dry run, and empty, 0 or false for a real one, so nothing is read or deleted"
+    exit 2
+    ;;
+esac
+case "$#:${1:-}" in
+  0:) ;;
+  1:--dry-run) DRY_RUN=1 ;;
+  *)
+    echo "::error::usage: ghcr-retention.sh [--dry-run]; nothing is read or deleted"
+    exit 2
+    ;;
+esac
+
 : "${PACKAGE:?PACKAGE is required — the container package name}"
 : "${KEEP:?KEEP is required — how many unprotected tagged versions survive}"
 : "${GITHUB_REPOSITORY_OWNER:?GITHUB_REPOSITORY_OWNER is required — the org that owns the package}"
@@ -57,8 +87,9 @@ RELEASE_TAGS_URL="${RELEASE_TAGS_URL:-https://dash.cerase.ai/api/v1/releases/tag
 ORG_PATH="/orgs/$ORG/packages/container/$PACKAGE"
 USER_PATH="/users/$ORG/packages/container/$PACKAGE"
 WORK="${RUNNER_TEMP:-/tmp}"
-# Only ever compared against the package's linked repository, to explain a
-# refusal. Outside a runner there is no such repository and the note is skipped.
+# The repository this run is in, compared against the package's linked
+# repository and named in what a dry run says a real prune needs. Outside a
+# runner there is none, and neither the note nor the name is printed.
 RUNNING_IN="${GITHUB_REPOSITORY:-}"
 
 # The status of the last failed gh call, read back out of its message because
@@ -131,25 +162,40 @@ read_release_tags() {
   jq -c --arg package "$PACKAGE" '.images[$package] // []' "$WORK/release-tags.json" >"$out"
 }
 
-# Selection, and the whole point of writing it out rather than passing a
-# pattern to an action: a version is protected by its TAGS. Untagged versions
-# go first because these images are one platform with provenance off, so an
+# The plan, and the whole point of writing it out rather than passing a pattern
+# to an action: a version is protected by its TAGS. Every version gets an action
+# and the one reason that decided it, oldest first. A tag latest, main or v*
+# protects before a release pin does, so the versions counted as pinned by a
+# release are the ones only the console's list keeps. Untagged versions are
+# deleted because these images are one platform with provenance off, so an
 # untagged manifest is a superseded build and never a child of a tagged index.
-cat >"$WORK/select.jq" <<'JQ'
+cat >"$WORK/plan.jq" <<'JQ'
 [ .[]
   | { id, created_at, tags: (.metadata.container.tags // []) }
-  | . + { protected: (.tags | any(. == "latest" or . == "main" or test("^v[0-9]")
-                                 or (. as $tag | $pinned | index([$tag]) != null))) }
+  | . + { by_tag: (.tags | any(. == "latest" or . == "main" or test("^v[0-9]"))),
+          by_release: (.tags | any(. as $tag | $pinned | index([$tag]) != null)) }
 ]
-| ( map(select((.tags | length) == 0)) ) as $untagged
-| ( map(select((.tags | length) > 0 and (.protected | not)))
+| ( map(select((.tags | length) > 0 and (.by_tag | not) and (.by_release | not)))
     | sort_by(.created_at)
-    | (if length > $keep then .[0 : length - $keep] else [] end) ) as $stale
-| ($untagged + $stale)
+    | (if length > $keep then [.[0 : length - $keep][] | .id] else [] end) ) as $stale
+| map(. + (if (.tags | length) == 0 then {action: "delete", reason: "untagged"}
+           elif .by_tag then {action: "keep", reason: "protected by tag"}
+           elif .by_release then {action: "keep", reason: "pinned by a release"}
+           elif (.id as $id | $stale | index([$id]) != null) then {action: "delete", reason: "older than the newest \($keep)"}
+           else {action: "keep", reason: "inside the newest \($keep)"} end)
+       | del(.by_tag, .by_release))
 | sort_by(.created_at)
-| .[]
-| "\(.id) \(.created_at) \(if (.tags|length) == 0 then "-" else (.tags|join(",")) end)"
 JQ
+
+plan() {   # <versions.json> <plan.json>
+  jq --argjson keep "$KEEP" --argjson pinned "$PINNED" -f "$WORK/plan.jq" "$1" >"$2"
+}
+
+# How many versions of a plan carry an action, and a reason when one is given.
+count() {   # <plan.json> <action> [<reason>]
+  jq --arg action "$2" --arg reason "${3:-}" \
+    '[.[] | select(.action == $action and ($reason == "" or .reason == $reason))] | length' "$1"
+}
 
 read_release_tags "$WORK/pinned.json" || {
   echo "::error::cannot read the tags live releases pin from $RELEASE_TAGS_URL, so nothing of $PACKAGE is deleted"
@@ -168,34 +214,49 @@ echo "read $(jq length "$WORK/versions.json") versions of $PACKAGE via $BASE"
 # only Write. A package stays linked to the repository that first published it,
 # so a repo that took over the build can hold Write and nothing more.
 #
-# The value is NORMALISED because it came back empty on the first real run and
-# both messages lost the one fact that tells an operator where to go: the log
-# read "is linked to  while this workflow runs in cerase-ai/cerase-core" and the
-# refusal read "run the retention from ,". GitHub omits the `repository` object
-# from the org-level package response when the calling token cannot see the
-# linked repository -- which is precisely the case this whole note exists for, a
-# package linked to a repo that is not this one -- and jq then prints nothing
-# while gh still exits 0, so the `|| echo` fallback never fires.
+# LINKED is the repository the package answer names, and empty when it names
+# none. A workflow token's answer carries no `repository` object, whether that
+# token can write packages or not and whichever repository the package is linked
+# to, and jq then prints nothing while gh still exits 0. Empty therefore means
+# unknown, never another repository: every message below says what the answer
+# named, and a real run explains a refused delete only when one is refused.
+#
+# A dry run makes no delete and cannot read who holds that role, so it states
+# what a real prune needs, the role and the linked repository, as facts to check
+# in the package's settings, and nothing about a delete being refused.
 LINKED="$(gh api "$ORG_PATH" --jq '.repository.full_name // empty' 2>/dev/null || true)"
-if [ -z "$LINKED" ]; then
-  LINKED="a repository this token cannot see"
-fi
-if [ -n "$RUNNING_IN" ] && [ "$LINKED" != "$RUNNING_IN" ]; then
+if [ -n "$DRY_RUN" ]; then
+  if [ -n "$LINKED" ]; then
+    link="the package is linked to $LINKED"
+  else
+    link="the repository the package is linked to cannot be read with this token"
+  fi
+  echo "a real prune${RUNNING_IN:+ from $RUNNING_IN} needs the admin role on the $PACKAGE package to delete a version; $link"
+elif [ -n "$LINKED" ] && [ -n "$RUNNING_IN" ] && [ "$LINKED" != "$RUNNING_IN" ]; then
   echo "note: $PACKAGE is linked to $LINKED while this workflow runs in $RUNNING_IN"
-  echo "note: if a delete below is refused, the missing Admin grant on the package is why"
 fi
 
-jq -r --argjson keep "$KEEP" --argjson pinned "$PINNED" -f "$WORK/select.jq" \
-  "$WORK/versions.json" >"$WORK/to-delete.txt"
+plan "$WORK/versions.json" "$WORK/plan.json"
+jq -r '.[] | select(.action == "delete")
+       | "\(.id) \(.created_at) \(if (.tags|length) == 0 then "-" else (.tags|join(",")) end) \(.reason)"' \
+  "$WORK/plan.json" >"$WORK/to-delete.txt"
 SELECTED="$(wc -l <"$WORK/to-delete.txt" | tr -d ' ')"
 
-jq -r '.[] | select((.metadata.container.tags // []) | any(. == "latest" or . == "main" or test("^v[0-9]")))
-       | "kept, protected by tag: \(.id) \(.metadata.container.tags | join(","))"' \
-  "$WORK/versions.json"
-jq -r --argjson pinned "$PINNED" '.[]
-       | select((.metadata.container.tags // []) | any(. as $tag | $pinned | index([$tag]) != null))
-       | "kept, pinned by a release: \(.id) \(.metadata.container.tags | join(","))"' \
-  "$WORK/versions.json"
+jq -r '.[] | select(.action == "keep") | "kept, \(.reason): \(.id) \(.tags | join(","))"' "$WORK/plan.json"
+
+if [ -n "$DRY_RUN" ]; then
+  while read -r id created tags reason; do
+    echo "would delete, $reason: $id $created $tags"
+  done <"$WORK/to-delete.txt"
+  echo "dry run: $PACKAGE keeps $(count "$WORK/plan.json" keep) of $(jq length "$WORK/plan.json") versions" \
+    "($(count "$WORK/plan.json" keep "protected by tag") protected by tag," \
+    "$(count "$WORK/plan.json" keep "pinned by a release") pinned by a release," \
+    "$(count "$WORK/plan.json" keep "inside the newest $KEEP") inside the newest $KEEP)" \
+    "and would delete $SELECTED ($(count "$WORK/plan.json" delete untagged) untagged," \
+    "$(count "$WORK/plan.json" delete "older than the newest $KEEP") older than the newest $KEEP);" \
+    "nothing was deleted"
+  exit 0
+fi
 
 if [ "$SELECTED" -eq 0 ]; then
   echo "nothing to prune: every version is protected or inside the newest $KEEP"
@@ -204,7 +265,7 @@ fi
 echo "selected $SELECTED versions to delete, oldest first"
 
 DELETED=0
-while read -r id created tags; do
+while read -r id created tags _; do
   if delete_version "$id"; then
     DELETED=$((DELETED + 1))
     echo "deleted $id $created $tags"
@@ -216,7 +277,11 @@ while read -r id created tags; do
   # package, so a version that reads back is one this token may not delete.
   if gh api "$BASE/versions/$id" >/dev/null 2>&1; then
     echo "::error::refused to delete version $id of $PACKAGE, which still exists."
-    echo "::error::Deleting needs the Admin role on the package and this token appears to hold Write. Grant this repository Admin on the package in the organization package settings, run the retention from the repository it is linked to ($LINKED), or supply a token carrying delete:packages."
+    if [ -n "$LINKED" ]; then
+      echo "::error::Deleting needs the Admin role on the package and this token appears to hold Write. Grant this repository Admin on the package in the organization package settings, run the retention from the repository it is linked to ($LINKED), or supply a token carrying delete:packages."
+    else
+      echo "::error::Deleting needs the Admin role on the package and this token appears to hold Write. This token's answer does not name the repository the package is linked to, and the organization package settings do: grant this repository Admin on the package there, run the retention from that repository, or supply a token carrying delete:packages."
+    fi
     exit 1
   fi
   echo "version $id was already gone, skipped"
@@ -231,7 +296,8 @@ LEFT=""
 for attempt in 1 2 3; do
   sleep $((attempt * 5))
   list_versions "$WORK/after.json" || continue
-  LEFT="$(jq -r --argjson keep "$KEEP" --argjson pinned "$PINNED" -f "$WORK/select.jq" "$WORK/after.json" | wc -l | tr -d ' ')"
+  plan "$WORK/after.json" "$WORK/after-plan.json"
+  LEFT="$(count "$WORK/after-plan.json" delete)"
   if [ "$LEFT" = "0" ]; then
     echo "$PACKAGE is at its floor: $(jq length "$WORK/after.json") versions remain"
     exit 0
