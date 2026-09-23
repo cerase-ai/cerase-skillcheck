@@ -171,7 +171,7 @@ read_release_tags() {
 # untagged manifest is a superseded build and never a child of a tagged index.
 cat >"$WORK/plan.jq" <<'JQ'
 [ .[]
-  | { id, created_at, tags: (.metadata.container.tags // []) }
+  | { id, name, created_at, tags: (.metadata.container.tags // []) }
   | . + { by_tag: (.tags | any(. == "latest" or . == "main" or test("^v[0-9]"))),
           by_release: (.tags | any(. as $tag | $pinned | index([$tag]) != null)) }
 ]
@@ -189,6 +189,60 @@ JQ
 
 plan() {   # <versions.json> <plan.json>
   jq --argjson keep "$KEEP" --argjson pinned "$PINNED" -f "$WORK/plan.jq" "$1" >"$2"
+  keep_referenced "$2"
+}
+
+# An untagged version is not always garbage. An attested or multi-arch image is
+# an index, and the manifests it lists are package versions with no tag of
+# their own: deleting "untagged" deleted the inside of every such image, and
+# left both meeting-bot packages with tags — `latest` among them —
+# whose index answered 200 and whose manifests answered 404. So every tagged
+# version this run keeps has its manifest read, and what an index lists is kept.
+#
+# A manifest that cannot be read deletes no untagged version at all: whether it
+# lists one is exactly what is unknown, and a prune that guesses is the defect.
+ACCEPT_MANIFESTS='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+
+registry_token() {
+  printf 'user = "x:%s"\n' "${GH_TOKEN:-${GITHUB_TOKEN:-}}" \
+    | curl -fsS --max-time 20 -K - "https://ghcr.io/token?scope=repository:$ORG/$PACKAGE:pull" 2>"$WORK/err" \
+    | jq -r '.token // empty'
+}
+
+keep_referenced() {   # <plan.json>
+  local file="$1" token="" name unreadable=""
+  [ "$(jq '[.[] | select(.action == "delete" and (.tags | length) == 0)] | length' "$file")" -gt 0 ] || return 0
+
+  # Every tagged version kept, by digest. None kept means nothing can list one.
+  jq -r '.[] | select(.action == "keep" and (.tags | length) > 0) | .name // "-"' "$file" >"$WORK/kept-names"
+  : >"$WORK/referenced"
+  if [ -s "$WORK/kept-names" ]; then
+    token="$(registry_token)"
+    [ -n "$token" ] || unreadable="the registry token"
+    while [ -z "$unreadable" ] && read -r name; do
+      if [ "$name" = "-" ]; then
+        unreadable="a kept version with no digest"
+      elif ! printf 'header = "Authorization: Bearer %s"\n' "$token" \
+          | curl -fsS --max-time 20 -K - -H "Accept: $ACCEPT_MANIFESTS" \
+            "https://ghcr.io/v2/$ORG/$PACKAGE/manifests/$name" >"$WORK/manifest.json" 2>"$WORK/err" \
+          || ! jq -r '.manifests[]?.digest' "$WORK/manifest.json" >>"$WORK/referenced" 2>/dev/null; then
+        unreadable="the manifest $name"
+      fi
+    done <"$WORK/kept-names"
+  fi
+
+  if [ -n "$unreadable" ]; then
+    echo "::warning::$unreadable of $PACKAGE could not be read, so no untagged version is deleted this run"
+    jq --arg why "the registry could not say what a kept index lists" \
+      'map(if .action == "delete" and (.tags | length) == 0 then .action = "keep" | .reason = $why else . end)' \
+      "$file" >"$file.tmp" && mv "$file.tmp" "$file"
+    return 0
+  fi
+
+  jq --slurpfile refs <(jq -R . "$WORK/referenced" | jq -s .) \
+    'map(if .action == "delete" and (.tags | length) == 0 and (.name as $n | $refs[0] | index($n)) != null
+         then .action = "keep" | .reason = "referenced by a kept index" else . end)' \
+    "$file" >"$file.tmp" && mv "$file.tmp" "$file"
 }
 
 # How many versions of a plan carry an action, and a reason when one is given.
