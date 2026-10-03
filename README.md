@@ -1,35 +1,36 @@
 # cerase-skillcheck
 
-Defensive security scan for third-party agent skills. A small FastAPI HTTP
-service that wraps [NVIDIA **skillspector**](https://github.com/NVIDIA/skillspector)
-(Apache-2.0) and returns an advisory risk verdict. It runs skillspector's
-**static** ruleset always, and — when configured — its **LLM intent analysis**
-routed through our own LiteLLM.
+An HTTP service (FastAPI) that scans an agent skill for security risks and
+returns an advisory verdict. It wraps
+[NVIDIA skillspector](https://github.com/NVIDIA/skillspector) (Apache-2.0),
+pinned to one commit in `requirements.txt`, and runs its static ruleset on
+every scan and its LLM intent analysis when a LiteLLM proxy is configured.
 
-Its job is to let the Cerase platform **warn a user, in plain language, before
-they install a risky third-party skill** — surfacing findings so they can judge.
-The verdict is **advisory only**: it never blocks an install and never
-quarantines anything. The user always retains the final choice.
+The Cerase platform uses the verdict to tell a person what a third-party skill
+does before they install it. The verdict never blocks an install and never
+quarantines anything; the person decides.
 
-This is **not an MCP** — it is a plain HTTP service. It runs as a
-cluster-internal compose service in `cerase-core` (no public port); the
-control-plane reaches it by hostname (`http://cerase-skillcheck:8000`).
+It is not an MCP server and not a Marketplace package. In a Cerase appliance it
+is an internal service with no published port, which the control-plane starts
+when a scan is requested and stops after a quiet period.
 
 ## Endpoints
 
-| Method | Path | Input | Purpose |
+| Method | Path | Input | Returns |
 |---|---|---|---|
-| `GET` | `/healthz` | — | Liveness + scanner version + how many scans are running. |
-| `POST` | `/scan` | JSON `{path}` or `{skill_md}` | Scan a mounted skill dir / `.md`, or raw `SKILL.md` content. |
-| `POST` | `/scan/bundle` | multipart `.zip` | Scan an uploaded skill bundle (full directory scan). |
+| `GET` | `/healthz` | none | Status, scanner version, whether LLM analysis is configured and with which model, scans in flight, age of the oldest one, the concurrency limit and the request deadline. |
+| `POST` | `/scan` | JSON with exactly one of `path` or `skill_md` | A verdict. |
+| `POST` | `/scan/bundle` | multipart upload of a `.zip` skill bundle | A verdict. |
 
-`POST /scan` takes **exactly one** of:
-- `path` — an absolute path already mounted in the container. A **directory** is
-  a full scan; a lone `.md` file is a `SKILL.md`-only (partial) scan.
-- `skill_md` — raw `SKILL.md` content, written to a temp file and scanned
-  (always partial coverage — used when only the manifest is available).
+`path` is an absolute path inside the container: a directory is scanned whole,
+a single `.md` file is scanned as a `SKILL.md` alone. `skill_md` is raw
+`SKILL.md` content, written to a temporary file and scanned alone. A bundle is
+extracted (entries that would escape the extraction directory are refused) and
+scanned whole. A missing path answers 404, a bundle that is not a `.zip` 415, a
+bundle over `SKILLCHECK_MAX_UPLOAD` 413, and a scan the scanner cannot complete
+422.
 
-## Verdict shape
+## Verdict
 
 ```json
 {
@@ -46,163 +47,112 @@ control-plane reaches it by hostname (`http://cerase-skillcheck:8000`).
 }
 ```
 
-`recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`; `severity` ∈
-`LOW | MEDIUM | HIGH | CRITICAL`. `partial: true` flags a `SKILL.md`-only scan
-(weaker coverage). `mode` ∈ `static | llm` — the analysis **actually
-performed**. `degraded: true` means LLM analysis was requested but the scan
-fell back to static (LiteLLM unreachable / misconfigured / the LLM stage
-failed) — a model outage **never** blocks a scan.
+- `score` is skillspector's 0-100 risk score; `severity` is `LOW`, `MEDIUM`,
+  `HIGH` or `CRITICAL`; `recommendation` is `SAFE`, `CAUTION` or
+  `DO_NOT_INSTALL`.
+- `partial: true` marks a scan of a `SKILL.md` alone, which sees less than a
+  scan of the whole skill.
+- `mode` is the analysis actually performed, `static` or `llm`.
+- `degraded: true` means LLM analysis was requested and the verdict is static
+  only.
 
-## Analysis modes — static and LLM-assisted
+## Static and LLM analysis
 
-skillspector's **static** ruleset (68 patterns across 17 categories) runs
-locally on every scan, no egress. When `LITELLM_BASE_URL` **and**
-`SKILLCHECK_LLM_API_KEY` are set, the service also enables skillspector's
-**LLM intent analysis**, routing its OpenAI provider at **our** LiteLLM
-(`OPENAI_BASE_URL = ${LITELLM_BASE_URL}/v1`, `OPENAI_API_KEY =` the service
-virtual key, `SKILLSPECTOR_MODEL =` the `core` alias). Whatever `core` maps to
-is our existing routing/metering — **no new sub-processor**. The service key is
-**never** the LiteLLM master key.
+The static ruleset runs locally with no network access, except that
+skillspector's supply-chain check may query `api.osv.dev` for dependency
+vulnerabilities; without network it falls back to a built-in list and the scan
+still completes.
 
-**Degrade to static.** Before an LLM scan the service probes LiteLLM's
-`/health/liveliness`; if unreachable it runs static-only and flags
-`degraded: true`. If LiteLLM is reachable but the LLM stage fails at runtime
-(bad key, timeout, every call erroring), the verdict is likewise mapped to
-`mode: static` / `degraded: true`. Either way a well-formed verdict is
-returned.
+LLM analysis is on when both `LITELLM_BASE_URL` and `SKILLCHECK_LLM_API_KEY`
+are set. skillspector's OpenAI provider is then pointed at
+`<LITELLM_BASE_URL>/v1` with that key and the model alias in
+`SKILLCHECK_LLM_MODEL`. Before each LLM scan the service checks LiteLLM's
+`/health/liveliness`; when it does not answer, the scan runs static only and
+is marked `degraded`.
 
-**A requested LLM stage that produced no completion is degraded, whatever
-stopped it.** The service routes the scanner's model calls through a loopback
-forwarder on `127.0.0.1` that relays each request to LiteLLM unchanged
-(`Authorization` included), returns the answer verbatim, and counts the
-responses that carried output. Zero of them means the semantic analyzers saw
-nothing, so the verdict is `mode: static` / `degraded: true` — the same
-treatment a timeout gets. A rejected key, a rate limit, a refused connection
-and a `200` with an empty `choices` array are one fact to a caller.
+The scanner's model calls pass through a forwarder on `127.0.0.1` started for
+each LLM scan. It relays every request to LiteLLM unchanged, adds the header
+`x-cerase-call-type: scan` so the spend is reported as scanning, and counts the
+responses that carried output. When an LLM scan produced no usable completion
+(a rejected key, a rate limit, an error, or an empty `choices` array), the
+verdict is `mode: static` with `degraded: true`. The count is needed because
+skillspector's own report marks the LLM pass as applied even when every call
+in three of its four LLM stages failed. A scanner exit code 2, or an LLM scan
+that runs out of time, is retried as a static scan and marked `degraded`.
 
-The count is needed because the report cannot carry that fact. skillspector
-marks a scan degraded only when its `llm_call_log` holds no successful record,
-and three of its four LLM nodes (`meta_analyzer`, `semantic_developer_intent`,
-`semantic_quality_policy`) run their batches through
-`LLMAnalyzerBase.arun_batches`, which drops a failed batch and returns the
-survivors — so a node whose every call was rejected records a *successful* call
-and `meta_analysis_applied` stays `true`. Measured with a key the router
-rejects: every call 401s in under a second, a bundle finishes in 2.4 s instead
-of 187 s, and the verdict read `SAFE / LOW / 0` with no findings and
-`degraded: false`. `tests/test_llm_degrade.py` drives that path and fails when
-the counting is removed.
+The scanner runs as `skillspector scan <target> [--no-llm] --format json
+--output <file>`, and the service reads the report from that file. Exit codes
+0 (score up to 50) and 1 (score above 50) both mean a valid report.
 
-## How skillspector is invoked
+## Load and liveness
 
-The service shells out to the pinned skillspector CLI:
+Each scan runs in a worker thread, at most `SKILLCHECK_MAX_CONCURRENT_SCANS` at
+a time; further requests wait for a slot within their deadline.
+`SKILLCHECK_SCAN_DEADLINE` bounds a whole request: the LLM attempt, the static
+fallback and the wait. `/healthz` runs on the event loop and touches only
+memory, so it answers while scans are running.
 
-```
-# static-only
-skillspector scan <target> --no-llm --format json --output <tmp.json>
-# LLM-assisted (LLM configured + LiteLLM reachable)
-skillspector scan <target>          --format json --output <tmp.json>
-```
+## Settings
 
-and reads the JSON report from the output file (decoupled from console output).
-Exit code `0` (score ≤ 50) and `1` (score > 50) both yield a valid report; exit
-`2` is a real error (in LLM mode it triggers a static fallback, `degraded:true`).
-
-**OSV.dev / offline.** skillspector's SC4 supply-chain check may query
-`api.osv.dev` for dependency vulnerabilities. When the network is unavailable it
-degrades **automatically** to a built-in fallback list, so a scan still returns
-a verdict offline. (If that egress is enabled in production, add an OSV.dev row
-to the sub-processor / egress doc.)
-
-## Env
-
-| Var | Default | Meaning |
+| Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `8000` | Listen port. |
-| `SKILLCHECK_SCAN_TIMEOUT` | `180` | Static-scan subprocess timeout (seconds). |
-| `SKILLCHECK_LLM_SCAN_TIMEOUT` | `300` | LLM-scan subprocess timeout (seconds). |
-| `SKILLCHECK_SCAN_DEADLINE` | `420` | Wall-clock ceiling for ONE request, covering the LLM attempt, the static fallback, and any wait for a scan slot. Without it the two step timeouts above simply add up. |
-| `SKILLCHECK_MAX_CONCURRENT_SCANS` | `2` | skillspector subprocesses allowed at once. Further requests wait for a slot inside their own deadline. |
-| `SKILLCHECK_MAX_UPLOAD` | `26214400` | Max `.zip` bundle upload size (bytes). |
-| `LITELLM_BASE_URL` | _(unset)_ | Our LiteLLM base (e.g. `http://cerase-litellm:4000`). Set **with** the key to enable LLM mode. |
-| `SKILLCHECK_LLM_API_KEY` | _(unset)_ | LiteLLM **service** virtual key (`cerase-svc-skillcheck`). Never the master key. Set **with** the base URL to enable LLM mode. |
-| `SKILLCHECK_LLM_MODEL` | `core` | LiteLLM model alias to route at; switch to a cheaper alias (e.g. `spark`). |
-| `SKILLCHECK_LLM_PROBE_TIMEOUT` | `5` | LiteLLM reachability-probe timeout (seconds). |
+| `SKILLCHECK_SCAN_TIMEOUT` | `180` | Timeout of a static scan, in seconds. |
+| `SKILLCHECK_LLM_SCAN_TIMEOUT` | `300` | Timeout of an LLM scan, in seconds. |
+| `SKILLCHECK_SCAN_DEADLINE` | `420` | Ceiling for one request, in seconds. |
+| `SKILLCHECK_MAX_CONCURRENT_SCANS` | `2` | Scans run at once. |
+| `SKILLCHECK_MAX_UPLOAD` | `26214400` (25 MiB) | Largest `.zip` bundle accepted. |
+| `LITELLM_BASE_URL` | unset | LiteLLM base URL; with the key below, turns LLM analysis on. |
+| `SKILLCHECK_LLM_API_KEY` | unset | LiteLLM key for this service; with the URL above, turns LLM analysis on. |
+| `SKILLCHECK_LLM_MODEL` | `core` | LiteLLM model alias the analysis uses. |
+| `SKILLCHECK_LLM_PROBE_TIMEOUT` | `5` | Timeout of the LiteLLM reachability check, in seconds. |
 
-LLM mode is **off** unless both `LITELLM_BASE_URL` and `SKILLCHECK_LLM_API_KEY`
-are set; with neither the service is static-only and identical to the M1 build.
-`GET /healthz` reports `llm_configured` + the active `llm_model`.
+## Build and run locally
 
-## Liveness while busy
+```sh
+docker build -t cerase-skillcheck .
+docker run --rm -p 8000:8000 cerase-skillcheck
+curl -s localhost:8000/healthz
+curl -s -X POST localhost:8000/scan -H 'Content-Type: application/json' \
+  -d '{"skill_md": "---\nname: demo\ndescription: A demo skill.\n---\nSay hello."}'
+```
 
-A scan is a blocking subprocess that runs for minutes. Every scan therefore runs
-in the threadpool, and `/healthz` is an async handler that touches nothing but
-memory, so it is answered on the event loop while scans are in flight. It
-reports `scans_in_flight`, `busy` and `oldest_scan_seconds`, which is what lets
-a caller tell a working scanner from a stuck one.
-
-This is not a refinement. `POST /scan/bundle` used to call the scan directly
-from an async handler, which held uvicorn's only event loop for the whole scan.
-Measured against the live service: one real bundle scan ran 237 seconds and
-across those 237 seconds nineteen consecutive `/healthz` probes hit their 10s
-ceiling and returned nothing, so the container was marked unhealthy while the
-scan it was running returned HTTP 200. `tests/test_liveness.py` holds both
-halves of the fix and fails when either is reverted.
-
-## Run shape
-
-`uvicorn server:app --host 0.0.0.0 --port 8000`. The GHCR image
-`ghcr.io/cerase-ai/cerase-skillcheck:<tag>` is built by
-`.github/workflows/publish.yml`. Local iteration from `cerase-core`:
-`./cli.sh build skillcheck`.
+The image runs `uvicorn server:app` under `tini`, as the unprivileged user
+`appuser`, and its `HEALTHCHECK` requests `/healthz`. Each push to `main` runs
+the tests and publishes `ghcr.io/cerase-ai/cerase-skillcheck`
+(`.github/workflows/publish.yml`).
 
 ## Tests
 
-Every file below runs in CI on each push and pull request, split by what it
-needs. The `tests` job runs the three offline files against pip wheels only
-(`fastapi`, `pydantic`, `python-multipart`, `httpx`, `pytest` — no skillspector
-install), and the `live-scan` job builds the image and runs
-`tests/test_scan.py` against the running container. `build-and-push` waits on
-both, so a failing test stops the publish. The offline job excludes
-`tests/test_scan.py` by name rather than listing the files to run, so a new
-offline file is picked up without editing the workflow.
+The offline tests need only `fastapi`, `pydantic`, `python-multipart`, `httpx`
+and `pytest`, with no skillspector installed:
 
-- `tests/test_helpers.py` (pytest) unit-tests the pure routing/degrade helpers
-  (mode-flag mapping, degrade-to-static, the model-alias knob, base-URL
-  normalisation) — no running service, no skillspector install needed:
+```sh
+python -m pytest tests --ignore=tests/test_scan.py
+```
 
-  ```
-  python -m pytest tests/test_helpers.py -v
-  ```
+- `tests/test_helpers.py`: mode flags, the degrade-to-static mapping, the
+  model-alias setting and base-URL normalisation.
+- `tests/test_llm_degrade.py`: a stand-in router and scanner; 401, 429, 500
+  and an empty `200` must each give `mode: static` and `degraded: true`, a
+  healthy router must keep `mode: llm`, and the key must reach the router
+  through the forwarder.
+- `tests/test_liveness.py`: the health probe must answer before a running scan
+  finishes, and no `async def` may call a blocking function.
+- `tests/test_scan_is_declared.py`: every completion through the forwarder
+  carries `x-cerase-call-type: scan`.
 
-- `tests/test_scan.py` (pytest) drives a **running** service over HTTP: it
-  asserts the verdict shape for a benign and a deliberately-suspicious sample
-  and that the suspicious one scores no lower than the benign one. It adapts its
-  `mode` assertions to the container's `/healthz` (`llm_configured`):
+`tests/test_scan.py` runs against a running service and checks the verdict
+shape for a benign and a suspicious sample:
 
-  ```
-  SKILLCHECK_URL=http://127.0.0.1:8000 python -m pytest tests/test_scan.py -v
-  ```
+```sh
+SKILLCHECK_URL=http://127.0.0.1:8000 python -m pytest tests/test_scan.py
+```
 
-- `tests/test_llm_degrade.py` (pytest) drives a scan against a stand-in router
-  and a stand-in scanner: every rejection shape (401 / 429 / 500 / a `200` with
-  no completion) must come back `mode: static` / `degraded: true`, a healthy
-  router must keep `mode: llm`, and the service key must still reach the router
-  through the forwarder. No running service and no skillspector install needed:
+CI runs the offline tests, then builds the image and runs `tests/test_scan.py`
+against it; the image is published only when both pass.
 
-  ```
-  python -m pytest tests/test_llm_degrade.py -v
-  ```
+## License
 
-- `tests/test_liveness.py` (pytest) drives the ASGI app with two concurrent
-  requests and requires the health probe to finish before the scan, and walks
-  the AST to refuse any `async def` that calls a blocking function directly — no
-  running service needed:
-
-  ```
-  python -m pytest tests/test_liveness.py -v
-  ```
-
-## Licensing
-
-Apache-2.0. Wraps and redistributes NVIDIA skillspector (Apache-2.0) at runtime
-— see `NOTICE`.
+Apache-2.0. See [LICENSE](LICENSE). skillspector is redistributed under its own
+Apache-2.0 licence; see [NOTICE](NOTICE).
