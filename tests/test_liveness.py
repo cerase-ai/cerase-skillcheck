@@ -80,9 +80,9 @@ def slow_scan(monkeypatch):
     """
     entered = threading.Event()
 
-    def _blocking_scan(target, *, partial):  # noqa: ANN001, ARG001
+    def _blocking_scan(target, *, partial, cancel=None):  # noqa: ANN001, ARG001
         budget = server.Budget(server._SCAN_DEADLINE)
-        with server._scan_slot(budget):
+        with server._scan_slot(budget, cancel):
             entered.set()
             time.sleep(FAKE_SCAN_SECONDS)
             return _fake_verdict()
@@ -174,6 +174,7 @@ def test_healthz_reports_the_scan_it_is_running(slow_scan):
 BLOCKING_CALLS = {
     "_scan_target",
     "_scan_bundle_payload",
+    "_scan_request_payload",
     "_run_skillspector",
     "_litellm_reachable",
     "_safe_extract_zip",

@@ -62,6 +62,17 @@ Liveness while busy
   ``/healthz`` reports ``scans_in_flight`` and ``busy`` so a reader can tell a
   working scanner from a stuck one instead of inferring it from a silence.
 
+A client that hangs up cancels its scan
+  Both scan endpoints watch the connection while the worker runs. When the
+  client disconnects, the scan's cancel flag is set: a request still waiting for
+  a slot stops waiting and takes none, a running scanner has its process group
+  killed and its completion proxy stopped, and the static fallback is not
+  started. The handler returns only after the worker has exited, so the slot is
+  free and ``/healthz`` no longer counts the scan. Before this, an abandoned
+  scan held its slot until the engine's own deadline: a client gave up after
+  450s while ``/healthz`` reported two scans in flight, the oldest at 475s, and
+  neither had anybody waiting for it.
+
 Verdict JSON
   {
     "score": 0-100,                              # skillspector risk score
@@ -109,6 +120,7 @@ Env
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import itertools
 import json
@@ -123,14 +135,14 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
@@ -148,6 +160,14 @@ _MAX_CONCURRENT_SCANS = max(1, int(os.environ.get("SKILLCHECK_MAX_CONCURRENT_SCA
 _MAX_UPLOAD = int(os.environ.get("SKILLCHECK_MAX_UPLOAD", str(25 * 1024 * 1024)))
 _PROBE_TIMEOUT = float(os.environ.get("SKILLCHECK_LLM_PROBE_TIMEOUT", "5"))
 _DEFAULT_LLM_MODEL = "core"
+
+# How often a blocked scan step (waiting for a slot, waiting on the scanner)
+# looks at its cancel flag. It bounds how long a scan outlives its client.
+_CANCEL_POLL_SECONDS = 0.25
+
+# The status a request ends with when its client disconnected before the
+# verdict. No client receives it.
+_CLIENT_CLOSED_REQUEST = 499
 
 app = FastAPI(
     title="cerase-skillcheck",
@@ -205,20 +225,29 @@ _scan_ids = itertools.count(1)
 
 
 @contextlib.contextmanager
-def _scan_slot(budget: Budget) -> Iterator[None]:
+def _scan_slot(budget: Budget, cancel: threading.Event | None = None) -> Iterator[None]:
     """Hold one scan slot for the duration of a scan, or fail inside the budget.
 
     Each skillspector run is a heavy subprocess, so the number that may run at
     once is bounded rather than left to however many requests arrive. A request
     that cannot get a slot waits only as long as its own budget allows and then
     fails as a scan error — never indefinitely, and never silently.
+
+    The wait is taken in short steps so a set *cancel* flag ends it with
+    :class:`ScanCancelled` and no slot taken: a request whose client has gone
+    must not take a slot from the next one in line.
     """
-    wait = budget.remaining()
-    if wait <= 0 or not _scan_slots.acquire(timeout=wait):
-        raise ScanError(
-            f"no scan slot free within {budget.total:.0f}s "
-            f"({_MAX_CONCURRENT_SCANS} concurrent scans allowed)"
-        )
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise ScanCancelled("the client disconnected while waiting for a scan slot")
+        wait = budget.remaining()
+        if wait <= 0:
+            raise ScanError(
+                f"no scan slot free within {budget.total:.0f}s "
+                f"({_MAX_CONCURRENT_SCANS} concurrent scans allowed)"
+            )
+        if _scan_slots.acquire(timeout=min(wait, _CANCEL_POLL_SECONDS)):
+            break
     scan_id = next(_scan_ids)
     with _scan_registry_lock:
         _scan_registry[scan_id] = time.monotonic()
@@ -624,6 +653,15 @@ class ScanError(RuntimeError):
     """skillspector failed to produce a report (non-verdict error)."""
 
 
+class ScanCancelled(Exception):
+    """The client that asked for this scan disconnected, so the scan was stopped.
+
+    Deliberately NOT a :class:`ScanError`: a scan error starts the static
+    fallback, which exists to give a waiting client a verdict, and a cancelled
+    scan has no client left to give one to.
+    """
+
+
 # ---------------------------------------------------------------------------
 # skillspector subprocess + verdict mapping
 # ---------------------------------------------------------------------------
@@ -644,8 +682,20 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
             proc.kill()
 
 
+def _stop_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Kill the scan's process group and reap the scanner."""
+    _kill_process_tree(proc)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.communicate(timeout=10)
+
+
 def _run_skillspector(
-    target: Path, *, use_llm: bool, budget: Budget, llm_base_url: str | None = None
+    target: Path,
+    *,
+    use_llm: bool,
+    budget: Budget,
+    llm_base_url: str | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Run skillspector on *target* and return its parsed JSON report.
 
@@ -654,11 +704,14 @@ def _run_skillspector(
     *llm_base_url* (the scan's completion proxy) or, absent one, straight at our
     LiteLLM. The step timeout is the smaller of its own ceiling and what is left
     of the request's *budget*. Raises :class:`ScanError` when no report is
-    produced.
+    produced, and :class:`ScanCancelled` when *cancel* is set before or during
+    the run, after killing the scanner's process group.
 
     ALWAYS runs on a worker thread, never on the event loop — see the module
     docstring. It blocks for as long as the scan takes.
     """
+    if cancel is not None and cancel.is_set():
+        raise ScanCancelled("the client disconnected before the scan started")
     env = _llm_scan_env(llm_base_url) if use_llm else _base_scan_env()
     step = float(_LLM_SCAN_TIMEOUT if use_llm else _SCAN_TIMEOUT)
     timeout = min(step, budget.remaining())
@@ -683,13 +736,24 @@ def _run_skillspector(
         except FileNotFoundError as exc:  # skillspector binary missing
             raise ScanError("skillspector executable not found") from exc
 
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            _kill_process_tree(proc)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=10)
-            raise ScanError(f"scan timed out after {timeout:.0f}s and was killed") from exc
+        # Waited on in short steps rather than in one call, so a client that
+        # disconnects stops the scanner within a step instead of at the timeout.
+        # Repeating communicate() after TimeoutExpired loses no output.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                stdout, stderr = proc.communicate(
+                    timeout=max(0.0, min(_CANCEL_POLL_SECONDS, deadline - time.monotonic()))
+                )
+                break
+            except subprocess.TimeoutExpired as exc:
+                expired = exc
+            if cancel is not None and cancel.is_set():
+                _stop_process_tree(proc)
+                raise ScanCancelled("the client disconnected; the scanner was killed")
+            if time.monotonic() >= deadline:
+                _stop_process_tree(proc)
+                raise ScanError(f"scan timed out after {timeout:.0f}s and was killed") from expired
 
         # Exit 0 = clean/low, 1 = risky (score>50) — both still write a report.
         # Exit 2 (or any other) = a real scan error (e.g. an LLM misconfig that
@@ -780,7 +844,7 @@ def _to_verdict(data: dict[str, Any], *, partial: bool, mode: str, degraded: boo
     )
 
 
-def _scan_target(target: Path, *, partial: bool) -> Verdict:
+def _scan_target(target: Path, *, partial: bool, cancel: threading.Event | None = None) -> Verdict:
     """Scan *target*, running LLM-assisted analysis when configured.
 
     Order of preference, always producing a verdict (never an error) when
@@ -800,15 +864,19 @@ def _scan_target(target: Path, *, partial: bool) -> Verdict:
     The whole sequence runs inside ONE budget and holds ONE scan slot, so a
     request cannot outlive ``SKILLCHECK_SCAN_DEADLINE`` however many steps it
     takes. Blocking throughout — callers must reach it off the event loop.
+
+    *cancel* is set when the client has disconnected. Every step then raises
+    :class:`ScanCancelled`, which no step below catches: the proxy is stopped,
+    the slot released, and no fallback is started for a client that is gone.
     """
     budget = Budget(_SCAN_DEADLINE)
-    with _scan_slot(budget):
+    with _scan_slot(budget, cancel):
         if not _llm_configured():
-            data = _run_skillspector(target, use_llm=False, budget=budget)
+            data = _run_skillspector(target, use_llm=False, budget=budget, cancel=cancel)
             return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=False)
 
         if not _litellm_reachable():
-            data = _run_skillspector(target, use_llm=False, budget=budget)
+            data = _run_skillspector(target, use_llm=False, budget=budget, cancel=cancel)
             return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
 
         proxy = _CompletionProxy(_litellm_root(), budget)
@@ -818,13 +886,17 @@ def _scan_target(target: Path, *, partial: bool) -> Verdict:
             # Nothing would be watching the LLM traffic, and an unwatched LLM
             # scan cannot be told apart from one that answered nothing.
             logger.warning("completion proxy did not start (%s) — scanning static", exc)
-            data = _run_skillspector(target, use_llm=False, budget=budget)
+            data = _run_skillspector(target, use_llm=False, budget=budget, cancel=cancel)
             return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
 
         try:
             try:
                 data = _run_skillspector(
-                    target, use_llm=True, budget=budget, llm_base_url=proxy.base_url
+                    target,
+                    use_llm=True,
+                    budget=budget,
+                    llm_base_url=proxy.base_url,
+                    cancel=cancel,
                 )
             finally:
                 proxy.stop()
@@ -833,7 +905,7 @@ def _scan_target(target: Path, *, partial: bool) -> Verdict:
             # scan; fall back to a static run on whatever budget is left and
             # flag the degradation.
             logger.warning("LLM scan failed (%s) — falling back to static", exc)
-            data = _run_skillspector(target, use_llm=False, budget=budget)
+            data = _run_skillspector(target, use_llm=False, budget=budget, cancel=cancel)
             return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
 
         completions = proxy.usable_completions
@@ -884,22 +956,78 @@ async def healthz() -> dict[str, Any]:
     }
 
 
+async def _until_disconnect(request: Request) -> None:
+    """Return when the client closes its connection.
+
+    FastAPI has read the whole request body before a handler runs, so the next
+    message the server delivers is the disconnect: uvicorn's ``receive()``
+    blocks until the connection closes and then answers ``http.disconnect``.
+    """
+    while True:
+        message = await request.receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def _scan_while_connected(
+    request: Request, work: Callable[[Any, threading.Event], Verdict], arg: Any
+) -> Verdict:
+    """Run the blocking *work* in the threadpool, and stop it if the client leaves.
+
+    The worker gets a cancel flag. When the client disconnects first, the flag
+    is set and this handler waits for the worker to exit before it returns, so
+    the scan's slot is free and ``/healthz`` no longer counts it by the time the
+    request ends. The request then ends with a 499 that no client receives,
+    and the warning logged here is its record.
+    """
+    cancel = threading.Event()
+    started = time.monotonic()
+    worker = asyncio.ensure_future(run_in_threadpool(work, arg, cancel))
+    hangup = asyncio.ensure_future(_until_disconnect(request))
+    try:
+        await asyncio.wait({worker, hangup}, return_when=asyncio.FIRST_COMPLETED)
+        if worker.done():
+            return worker.result()
+        cancel.set()
+        with contextlib.suppress(ScanCancelled, HTTPException):
+            await worker
+        logger.warning(
+            "client disconnected after %.1fs; its scan was stopped and the slot released",
+            time.monotonic() - started,
+        )
+        raise HTTPException(
+            status_code=_CLIENT_CLOSED_REQUEST, detail="client disconnected; scan cancelled"
+        )
+    finally:
+        # Also reached when this handler is itself cancelled: the worker must
+        # not outlive the request that started it.
+        cancel.set()
+        hangup.cancel()
+
+
 @app.post("/scan", response_model=Verdict)
-def scan(req: ScanRequest) -> Verdict:
+async def scan(req: ScanRequest, request: Request) -> Verdict:
     """Scan a mounted path or raw SKILL.md content.
 
     A directory is a full scan; a lone `.md` file or `skill_md` content is a
     SKILL.md-only (partial) scan whose weaker coverage is flagged in `partial`.
     LLM-assisted analysis runs when configured, else static-only; either way a
     verdict is returned (a model outage degrades to static, never a 5xx).
+
+    The scan runs in the threadpool and is cancelled if the client disconnects.
     """
+    return await _scan_while_connected(request, _scan_request_payload, req)
+
+
+def _scan_request_payload(req: ScanRequest, cancel: threading.Event) -> Verdict:
+    """Resolve a /scan request to a target and scan it. Blocking — threadpool only."""
     if req.path:
         target = Path(req.path)
         if not target.exists():
             raise HTTPException(status_code=404, detail=f"path not found: {req.path}")
         partial = target.is_file() and target.suffix.lower() == ".md"
         try:
-            return _scan_target(target, partial=partial)
+            return _scan_target(target, partial=partial, cancel=cancel)
         except ScanError as exc:
             raise HTTPException(status_code=422, detail=f"scan failed: {exc}") from exc
 
@@ -908,19 +1036,19 @@ def scan(req: ScanRequest) -> Verdict:
         md_path = Path(tmp) / "SKILL.md"
         md_path.write_text(req.skill_md or "", encoding="utf-8")
         try:
-            return _scan_target(md_path, partial=True)
+            return _scan_target(md_path, partial=True, cancel=cancel)
         except ScanError as exc:
             raise HTTPException(status_code=422, detail=f"scan failed: {exc}") from exc
 
 
 @app.post("/scan/bundle", response_model=Verdict)
-async def scan_bundle(file: UploadFile) -> Verdict:
+async def scan_bundle(file: UploadFile, request: Request) -> Verdict:
     """Scan an uploaded **.zip** skill bundle (full directory scan).
 
     Only the upload is awaited here. Extraction and the scan are blocking and go
     to the threadpool, because this handler runs on the event loop and calling
     them directly stopped the whole service — health probe included — for the
-    length of the scan.
+    length of the scan. The scan is cancelled if the client disconnects.
     """
     name = (file.filename or "").lower()
     if not name.endswith(".zip"):
@@ -932,10 +1060,10 @@ async def scan_bundle(file: UploadFile) -> Verdict:
             status_code=413, detail=f"bundle exceeds {_MAX_UPLOAD} bytes"
         )
 
-    return await run_in_threadpool(_scan_bundle_payload, payload)
+    return await _scan_while_connected(request, _scan_bundle_payload, payload)
 
 
-def _scan_bundle_payload(payload: bytes) -> Verdict:
+def _scan_bundle_payload(payload: bytes, cancel: threading.Event) -> Verdict:
     """Extract an uploaded bundle and scan it. Blocking — threadpool only."""
     tmp = tempfile.mkdtemp(prefix="skillcheck-bundle-")
     try:
@@ -949,7 +1077,7 @@ def _scan_bundle_payload(payload: bytes) -> Verdict:
 
         root = _skill_root(extract_dir)
         try:
-            return _scan_target(root, partial=False)
+            return _scan_target(root, partial=False, cancel=cancel)
         except ScanError as exc:
             raise HTTPException(status_code=422, detail=f"scan failed: {exc}") from exc
     finally:

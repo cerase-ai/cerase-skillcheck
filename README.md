@@ -92,6 +92,11 @@ a time; further requests wait for a slot within their deadline.
 fallback and the wait. `/healthz` runs on the event loop and touches only
 memory, so it answers while scans are running.
 
+When the client of `/scan` or `/scan/bundle` disconnects, its scan is
+cancelled: the scanner's process group is killed, no static fallback is
+started, and the slot is released within about a second. A request still
+waiting for a slot stops waiting when its client disconnects, and takes none.
+
 ## Settings
 
 | Variable | Default | Purpose |
@@ -141,6 +146,10 @@ python -m pytest tests --ignore=tests/test_scan.py
   finishes, and no `async def` may call a blocking function.
 - `tests/test_scan_is_declared.py`: every completion through the forwarder
   carries `x-cerase-call-type: scan`.
+- `tests/test_client_disconnect.py`: a client that disconnects mid-scan must
+  leave its slot free within seconds, with the scanner killed and no static
+  fallback; a request waiting for a slot must stop waiting; and the next
+  client in line must get its verdict.
 
 `tests/test_scan.py` runs against a running service and checks the verdict
 shape for a benign and a suspicious sample:
