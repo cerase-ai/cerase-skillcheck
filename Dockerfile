@@ -24,6 +24,36 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
+# Raise skillspector's hardcoded 120 s per-call model timeout to
+# SKILLCHECK_LLM_CALL_TIMEOUT (default 900) at build time. skillspector reads
+# no setting for this: the value is a literal in llm_utils.get_chat_model and
+# in the OpenAI provider's default. Measured 16 Oct 2026, single model calls
+# took 163-811 s (reasoning tokens), so every call was cut at 120 and the scan
+# returned a static verdict the control-plane discarded.
+#
+# The patcher is server.py's, so build and tests share one definition, and it
+# RAISES when either literal is missing: a skillspector bump that moves a line
+# fails this build instead of silently restoring the cut.
+COPY server.py /tmp/cerase-patch/server.py
+RUN python - <<'PY'
+import pathlib
+import sys
+
+import skillspector
+
+sys.path.insert(0, "/tmp/cerase-patch")
+import server
+
+root = pathlib.Path(skillspector.__file__).parent
+for relative, line in server._SKILLSPECTOR_TIMEOUT_PATCHES:
+    source_path = root / relative
+    original = source_path.read_text(encoding="utf-8")
+    source_path.write_text(
+        server._patch_skillspector_llm_call_timeout(original, line),
+        encoding="utf-8",
+    )
+PY
+
 # ---- runtime ---------------------------------------------------------------
 FROM python:3.13.9-slim@sha256:326df678c20c78d465db501563f3492d17c42a4afe33a1f2bf5406a1d56b0e86
 

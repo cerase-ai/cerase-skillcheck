@@ -100,12 +100,18 @@ skillspector invocation
 Env
   PORT                       listen port (default 8000).
   SKILLCHECK_SCAN_TIMEOUT    static-scan subprocess timeout, seconds (def 180).
-  SKILLCHECK_LLM_SCAN_TIMEOUT LLM-scan subprocess timeout, seconds (def 300).
+  SKILLCHECK_LLM_CALL_TIMEOUT ceiling for ONE model call inside the LLM step,
+                             seconds (default 900). skillspector cuts its
+                             OpenAI client calls at a hardcoded 120 s; measured
+                             calls ran to 811 s, so the image build patches that
+                             literal to read this (see
+                             _patch_skillspector_llm_call_timeout).
+  SKILLCHECK_LLM_SCAN_TIMEOUT LLM-scan subprocess timeout, seconds (def 1800).
   SKILLCHECK_SCAN_DEADLINE   wall-clock ceiling for ONE request, seconds (def
-                             420), covering the LLM attempt AND the static
-                             fallback AND any wait for a scan slot. Without it
-                             the two step timeouts add up (300 + 180) and no
-                             single number bounds a request.
+                             2100), covering the LLM attempt AND the static
+                             fallback AND any wait for a scan slot. It outlasts
+                             the model step (1800) plus the static fallback
+                             (180), so a failed LLM run can still degrade.
   SKILLCHECK_MAX_CONCURRENT_SCANS how many skillspector subprocesses may run at
                              once (default 2). Each is a heavy tree; further
                              requests wait for a slot inside their own deadline.
@@ -154,8 +160,14 @@ _VALID_RECOMMENDATIONS = {"SAFE", "CAUTION", "DO_NOT_INSTALL"}
 _VALID_SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 
 _SCAN_TIMEOUT = int(os.environ.get("SKILLCHECK_SCAN_TIMEOUT", "180"))
-_LLM_SCAN_TIMEOUT = int(os.environ.get("SKILLCHECK_LLM_SCAN_TIMEOUT", "300"))
-_SCAN_DEADLINE = float(os.environ.get("SKILLCHECK_SCAN_DEADLINE", "420"))
+# A single model call may spend most of its time in reasoning tokens: measured
+# 16 Oct 2026, three skills of 4.5 kB, 2.3 kB and 1.2 kB took 163-811 s per
+# call. The default ceiling is 900 so a slow-but-answering model is not cut;
+# skillspector's own client timeout is hardcoded to 120 and is patched at image
+# build to read this variable (see _SKILLSPECTOR_TIMEOUT_PATCHES below).
+_LLM_CALL_TIMEOUT_DEFAULT = 900
+_LLM_SCAN_TIMEOUT = int(os.environ.get("SKILLCHECK_LLM_SCAN_TIMEOUT", "1800"))
+_SCAN_DEADLINE = float(os.environ.get("SKILLCHECK_SCAN_DEADLINE", "2100"))
 _MAX_CONCURRENT_SCANS = max(1, int(os.environ.get("SKILLCHECK_MAX_CONCURRENT_SCANS", "2")))
 _MAX_UPLOAD = int(os.environ.get("SKILLCHECK_MAX_UPLOAD", str(25 * 1024 * 1024)))
 _PROBE_TIMEOUT = float(os.environ.get("SKILLCHECK_LLM_PROBE_TIMEOUT", "5"))
@@ -168,6 +180,79 @@ _CANCEL_POLL_SECONDS = 0.25
 # The status a request ends with when its client disconnected before the
 # verdict. No client receives it.
 _CLIENT_CLOSED_REQUEST = 499
+
+
+def _llm_call_timeout() -> float:
+    """Ceiling for ONE model call, in seconds, read at call time.
+
+    Defaults to :data:`_LLM_CALL_TIMEOUT_DEFAULT` (900). skillspector does not
+    read a setting for this, so the value also has to be patched into its
+    client at image build (see :data:`_SKILLSPECTOR_TIMEOUT_PATCHES`); this
+    accessor is the one the engine uses for the proxy and the scanner env, so
+    the three cannot drift.
+    """
+    raw = os.environ.get("SKILLCHECK_LLM_CALL_TIMEOUT", str(_LLM_CALL_TIMEOUT_DEFAULT))
+    return float(raw)
+
+
+# ---------------------------------------------------------------------------
+# Build-time patch: skillspector's per-call 120 s cut reads our setting
+# ---------------------------------------------------------------------------
+#
+# There is no setting skillspector reads for this. Verified against the pinned
+# commit (requirements.txt), the OpenAI client timeout is a literal in
+# ``llm_utils.get_chat_model`` (``timeout=120``) and the OpenAI provider's
+# default (``timeout: float | None = 120``). The image build therefore rewrites
+# both to call our helper, which reads SKILLCHECK_LLM_CALL_TIMEOUT. The patch
+# is a hard failure when a literal is missing, so a skillspector bump that
+# moves it fails the build instead of silently restoring the 120 s cut. The
+# function lives here, not in the Dockerfile, so the build and these tests
+# exercise the one definition.
+
+# (path under the skillspector package, the exact line the pinned commit ships)
+_SKILLSPECTOR_TIMEOUT_PATCHES: tuple[tuple[str, str], ...] = (
+    ("llm_utils.py", "        timeout=120,"),
+    ("providers/openai/provider.py", "        timeout: float | None = 120,"),
+)
+
+
+class SkillspectorPatchError(RuntimeError):
+    """The pinned skillspector source did not contain the line to patch."""
+
+
+# Injected verbatim after the module's ``__future__`` import. Read at call time
+# so the scanner subprocess honours the value the engine put in its environment.
+_SKILLSPECTOR_TIMEOUT_HELPER = '''\
+import os as _cerase_os
+
+
+def _cerase_llm_call_timeout() -> float:
+    """Per-call model ceiling: cerase's setting, not a hardcoded cut."""
+    return float(_cerase_os.environ.get("SKILLCHECK_LLM_CALL_TIMEOUT", "900"))
+'''
+
+
+def _patch_skillspector_llm_call_timeout(source: str, line: str) -> str:
+    """Rewrite one skillspector source file to read our call-timeout setting.
+
+    *source* is the file's text and *line* the exact literal it must contain.
+    The helper is injected after the ``__future__`` import and the literal is
+    replaced with a call to it. Raises :class:`SkillspectorPatchError` when the
+    line is absent or not unique, so the image build fails loudly rather than
+    shipping a scanner that still cuts calls at 120 s.
+    """
+    count = source.count(line)
+    if count != 1:
+        raise SkillspectorPatchError(
+            f"expected exactly one {line!r} in the skillspector source, found {count}"
+        )
+    marker = "from __future__ import annotations\n"
+    if marker not in source:
+        raise SkillspectorPatchError("skillspector source has no __future__ import")
+    replacement = line.replace("120", "_cerase_llm_call_timeout()")
+    patched = source.replace(line, replacement, 1)
+    return patched.replace(marker, marker + _SKILLSPECTOR_TIMEOUT_HELPER, 1)
+
 
 app = FastAPI(
     title="cerase-skillcheck",
@@ -352,12 +437,18 @@ def _llm_scan_env(base_url: str | None = None) -> dict[str, str]:
     loopback address of its :class:`_CompletionProxy` there, which forwards to
     the same LiteLLM and counts what comes back; with it omitted the scanner
     talks to LiteLLM directly and nothing observes the completions.
+
+    ``SKILLCHECK_LLM_CALL_TIMEOUT`` is stated explicitly (not left to the
+    ambient environment) because the patched skillspector reads it per call:
+    the engine's value, the proxy's upstream allowance and the scanner's client
+    ceiling are then the same number by construction.
     """
     env = _base_scan_env()
     env["SKILLSPECTOR_PROVIDER"] = "openai"
     env["OPENAI_API_KEY"] = _llm_api_key()
     env["OPENAI_BASE_URL"] = base_url or _openai_base_url()
     env["SKILLSPECTOR_MODEL"] = _llm_model()
+    env["SKILLCHECK_LLM_CALL_TIMEOUT"] = str(int(_llm_call_timeout()))
     return env
 
 
@@ -539,7 +630,14 @@ class _CompletionProxy:
     # -- forwarding ---------------------------------------------------------
 
     def _timeout(self) -> float:
-        return max(1.0, min(float(_LLM_SCAN_TIMEOUT), self._budget.remaining()))
+        """Upstream read timeout, kept at or above one model call.
+
+        A call may take up to ``SKILLCHECK_LLM_CALL_TIMEOUT`` and the proxy
+        relaying it must not be the next limit to cut it, so the allowance is
+        at least that ceiling — never more than the request's remaining budget.
+        """
+        ceiling = max(_llm_call_timeout(), float(_LLM_SCAN_TIMEOUT))
+        return max(1.0, min(ceiling, self._budget.remaining()))
 
     def _forward(self, handler: BaseHTTPRequestHandler, method: str) -> None:
         length = int(handler.headers.get("Content-Length") or 0)

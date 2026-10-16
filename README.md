@@ -103,14 +103,26 @@ waiting for a slot stops waiting when its client disconnects, and takes none.
 |---|---|---|
 | `PORT` | `8000` | Listen port. |
 | `SKILLCHECK_SCAN_TIMEOUT` | `180` | Timeout of a static scan, in seconds. |
-| `SKILLCHECK_LLM_SCAN_TIMEOUT` | `300` | Timeout of an LLM scan, in seconds. |
-| `SKILLCHECK_SCAN_DEADLINE` | `420` | Ceiling for one request, in seconds. |
+| `SKILLCHECK_LLM_CALL_TIMEOUT` | `900` | Ceiling for one model call inside the LLM step, in seconds. |
+| `SKILLCHECK_LLM_SCAN_TIMEOUT` | `1800` | Timeout of an LLM scan's subprocess, in seconds. |
+| `SKILLCHECK_SCAN_DEADLINE` | `2100` | Ceiling for one request, in seconds. |
 | `SKILLCHECK_MAX_CONCURRENT_SCANS` | `2` | Scans run at once. |
 | `SKILLCHECK_MAX_UPLOAD` | `26214400` (25 MiB) | Largest `.zip` bundle accepted. |
 | `LITELLM_BASE_URL` | unset | LiteLLM base URL; with the key below, turns LLM analysis on. |
 | `SKILLCHECK_LLM_API_KEY` | unset | LiteLLM key for this service; with the URL above, turns LLM analysis on. |
 | `SKILLCHECK_LLM_MODEL` | `core` | LiteLLM model alias the analysis uses. |
 | `SKILLCHECK_LLM_PROBE_TIMEOUT` | `5` | Timeout of the LiteLLM reachability check, in seconds. |
+
+The three timeouts are ordered so each layer outlasts the one inside it: a
+model call (`SKILLCHECK_LLM_CALL_TIMEOUT`, 900 s) is not cut by the model step
+(`SKILLCHECK_LLM_SCAN_TIMEOUT`, 1800 s), and the model step plus the static
+fallback (180 s) fit inside the request deadline (`SKILLCHECK_SCAN_DEADLINE`,
+2100 s). The call ceiling is 900 s because measured calls ran from 163 s to
+811 s, almost all of it reasoning tokens; at the previous 120 s every call was
+cut before the model answered. skillspector reads no setting for its per-call
+timeout, so the image build patches the two literals that hardcode 120 s to
+read `SKILLCHECK_LLM_CALL_TIMEOUT`, and fails the build if either line is
+missing.
 
 ## Build and run locally
 
@@ -142,6 +154,10 @@ python -m pytest tests --ignore=tests/test_scan.py
   and an empty `200` must each give `mode: static` and `degraded: true`, a
   healthy router must keep `mode: llm`, and the key must reach the router
   through the forwarder.
+- `tests/test_llm_call_timeout.py`: the per-call ceiling defaults to 900 s and
+  is configurable, the three timeouts are ordered call < step < deadline, the
+  scanner subprocess is handed the configured value, and the build patch
+  rewrites skillspector's two 120 s literals and fails when one is missing.
 - `tests/test_liveness.py`: the health probe must answer before a running scan
   finishes, and no `async def` may call a blocking function.
 - `tests/test_scan_is_declared.py`: every completion through the forwarder
