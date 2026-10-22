@@ -499,6 +499,45 @@ _HOP_BY_HOP_HEADERS = frozenset(
 _COMPLETION_PATHS = ("/chat/completions", "/completions", "/responses", "/messages")
 
 
+# Added to every model request. The scanner's prompts are English and its
+# findings carry free text (`explanation`, `remediation`) that Cerase shows to a
+# person who reads Italian. The prompts belong to skillspector and are pinned
+# by commit, so the instruction travels with the request instead of patching
+# the library; it names only the two prose fields and asks that everything the
+# schema fixes stays as the schema defines it.
+_ITALIAN_FINDINGS_INSTRUCTION = (
+    "Language of the answer: write the values of the JSON fields `explanation` "
+    "and `remediation` of every finding in Italian, in plain words a non-technical "
+    "reader understands, and name the exact clause or instruction concerned. "
+    "Keep every key, rule id, category, severity, confidence, recommendation, "
+    "file path and other enumerated or structural value exactly as the response "
+    "schema defines it, in English where the schema says so."
+)
+
+
+def _with_findings_language(body: bytes) -> bytes:
+    """The request body with the Italian instruction as its first message.
+
+    A body that is not a JSON object holding a ``messages`` list is returned as
+    it came, and so is one that already starts with the instruction.
+    """
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        return body
+    messages = data["messages"]
+    if (
+        messages
+        and isinstance(messages[0], dict)
+        and messages[0].get("content") == _ITALIAN_FINDINGS_INSTRUCTION
+    ):
+        return body
+    data["messages"] = [{"role": "system", "content": _ITALIAN_FINDINGS_INSTRUCTION}, *messages]
+    return json.dumps(data).encode("utf-8")
+
+
 def _choice_carries_output(choice: Any) -> bool:
     """Whether one element of ``choices`` holds text or a tool call."""
     if not isinstance(choice, dict):
@@ -662,6 +701,8 @@ class _CompletionProxy:
         # Overwritten rather than defaulted: the value is ours to state, and a
         # scanner that ever set its own must not be able to relabel our spend.
         headers["x-cerase-call-type"] = "scan"
+        if method == "POST" and handler.path.split("?", 1)[0].endswith(_COMPLETION_PATHS):
+            body = _with_findings_language(body)
         request = urllib.request.Request(  # noqa: S310 (internal host)
             self._upstream + handler.path,
             data=body if method == "POST" else None,
