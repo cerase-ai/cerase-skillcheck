@@ -33,7 +33,9 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 #
 # The patcher is server.py's, so build and tests share one definition, and it
 # RAISES when either literal is missing: a skillspector bump that moves a line
-# fails this build instead of silently restoring the cut.
+# fails this build instead of silently restoring the cut. The same block also
+# adds a missing item to SQP-3's "Do NOT flag if" list, so a skill merely
+# written in a language other than English is not reported as forcing one.
 COPY server.py /tmp/cerase-patch/server.py
 RUN python - <<'PY'
 import pathlib
@@ -52,6 +54,13 @@ for relative, line in server._SKILLSPECTOR_TIMEOUT_PATCHES:
         server._patch_skillspector_llm_call_timeout(original, line),
         encoding="utf-8",
     )
+
+sqp3_path = root / server._SKILLSPECTOR_SQP3_PATCH[0]
+original = sqp3_path.read_text(encoding="utf-8")
+sqp3_path.write_text(
+    server._patch_skillspector_sqp3(original),
+    encoding="utf-8",
+)
 PY
 
 # ---- runtime ---------------------------------------------------------------

@@ -122,7 +122,9 @@ fallback (180 s) fit inside the request deadline (`SKILLCHECK_SCAN_DEADLINE`,
 cut before the model answered. skillspector reads no setting for its per-call
 timeout, so the image build patches the two literals that hardcode 120 s to
 read `SKILLCHECK_LLM_CALL_TIMEOUT`, and fails the build if either line is
-missing.
+missing. It also adds a missing item to SQP-3's "Do NOT flag if" list, so a
+skill merely written in a language other than English is not reported as
+forcing one.
 
 ## Build and run locally
 

@@ -133,15 +133,56 @@ def test_a_completion_gets_the_instruction_before_the_original_messages() -> Non
 
     assert len(seen) == 1, "the proxy did not forward exactly one request"
     forwarded = json.loads(seen[0].body)
-    assert forwarded["messages"][0] == {
+    messages = forwarded["messages"]
+    assert messages[0] == {
         "role": "system",
         "content": server._ITALIAN_FINDINGS_INSTRUCTION,
     }
-    assert forwarded["messages"][1:] == body["messages"]
+    assert messages[1 : 1 + len(body["messages"])] == body["messages"]
     assert forwarded["model"] == body["model"]
     assert forwarded["response_format"] == body["response_format"]
     assert forwarded["tools"] == body["tools"]
     assert set(forwarded) == set(body)
+
+
+def test_a_completion_restates_the_instruction_after_the_last_message() -> None:
+    """The rule text and numbered file are one long user message in the scanner.
+
+    A system message at the front is far from where the model writes, so the
+    instruction is repeated after the last message as well.
+    """
+    body = {
+        "model": "core",
+        "messages": [
+            {"role": "system", "content": "You review skills."},
+            {"role": "user", "content": "analyse this skill"},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    seen = _forward(json.dumps(body).encode())
+
+    assert len(seen) == 1, "the proxy did not forward exactly one request"
+    forwarded = json.loads(seen[0].body)
+    messages = forwarded["messages"]
+    assert messages[0] == {
+        "role": "system",
+        "content": server._ITALIAN_FINDINGS_INSTRUCTION,
+    }
+    assert messages[-1] == {
+        "role": "system",
+        "content": server._ITALIAN_FINDINGS_RESTATED,
+    }
+    assert messages[1:-1] == body["messages"]
+
+
+def test_the_restatement_asks_for_italian_prose_and_unchanged_values() -> None:
+    restated = server._ITALIAN_FINDINGS_RESTATED
+
+    assert isinstance(restated, str)
+    assert "Italian" in restated
+    assert "explanation" in restated
+    assert "remediation" in restated
 
 
 def test_the_instruction_asks_for_italian_prose_and_unchanged_values() -> None:
@@ -182,6 +223,10 @@ def test_the_rewrite_does_not_prepend_the_instruction_twice() -> None:
         "role": "system",
         "content": server._ITALIAN_FINDINGS_INSTRUCTION,
     }
+    restated_message = {
+        "role": "system",
+        "content": server._ITALIAN_FINDINGS_RESTATED,
+    }
     body = {
         "model": "core",
         "messages": [instruction_message, {"role": "user", "content": "analyse this skill"}],
@@ -192,7 +237,13 @@ def test_the_rewrite_does_not_prepend_the_instruction_twice() -> None:
     twice = server._with_findings_language(once)
 
     rewritten = json.loads(twice)
-    assert rewritten["messages"] == body["messages"]
+    messages = rewritten["messages"]
     assert (
-        sum(1 for message in rewritten["messages"] if message == instruction_message) == 1
+        sum(1 for message in messages if message == instruction_message) == 1
     ), "a second instruction was prepended"
+    assert (
+        sum(1 for message in messages if message == restated_message) == 1
+    ), "a second restatement was appended"
+    assert messages[0] == instruction_message
+    assert messages[-1] == restated_message
+    assert messages[1:-1] == body["messages"][1:]

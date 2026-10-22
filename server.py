@@ -254,6 +254,60 @@ def _patch_skillspector_llm_call_timeout(source: str, line: str) -> str:
     return patched.replace(marker, marker + _SKILLSPECTOR_TIMEOUT_HELPER, 1)
 
 
+# ---------------------------------------------------------------------------
+# Build-time patch: SQP-3 no longer flags a skill for its language
+# ---------------------------------------------------------------------------
+#
+# On 22 October live scans got SQP-3 findings whose explanations said the skill
+# "is written entirely in Italian", "requires the final message to be in
+# Italian" or "uses an Italian-language placeholder". A skill written in the
+# language of its users is not forcing a language on anyone, but the pinned
+# SQP-3 ``Do NOT flag if`` list has no item saying so. The rule's text belongs
+# to skillspector and is pinned by commit, so the image build patches it the
+# same way it patches the per-call timeout, and fails the build if the block
+# moves.
+
+# (path under the skillspector package, the text around the insertion point)
+_SKILLSPECTOR_SQP3_PATCH: tuple[str, str] = (
+    "nodes/analyzers/semantic_quality_policy.py",
+    "  region-specific compliance tool)\n\nUse rule ID **SQP-3**",
+)
+
+_SKILLSPECTOR_SQP3_LANGUAGE_ITEM = (
+    "- The skill is written in a language other than English, names things or\n"
+    "  uses placeholders in that language, or tells the assistant to answer in\n"
+    "  the language the user writes in. Writing a skill in the language of the\n"
+    "  people who use it does not force a language on them. Flag only an\n"
+    "  instruction that makes the assistant answer in a fixed language even\n"
+    "  when the user writes in another one.\n"
+)
+
+
+def _patch_skillspector_sqp3(source: str) -> str:
+    """Insert the language item into skillspector's SQP-3 ``Do NOT flag if`` list.
+
+    *source* is the file's text. The item is added after the list's existing
+    entries and before the blank line that precedes the rule's summary line,
+    worded so a skill merely written in another language is not reported as
+    forcing one. Raises :class:`SkillspectorPatchError` when the anchor is
+    absent or not unique, so a skillspector bump that moves the block fails the
+    build instead of silently restoring the false positives. The anchor spans
+    the insertion point, so applying this twice also fails loudly.
+    """
+    _, anchor = _SKILLSPECTOR_SQP3_PATCH
+    count = source.count(anchor)
+    if count != 1:
+        raise SkillspectorPatchError(
+            f"expected exactly one SQP-3 anchor in the skillspector source, found {count}"
+        )
+    replacement = (
+        "  region-specific compliance tool)\n"
+        + _SKILLSPECTOR_SQP3_LANGUAGE_ITEM
+        + "\nUse rule ID **SQP-3**"
+    )
+    return source.replace(anchor, replacement, 1)
+
+
 app = FastAPI(
     title="cerase-skillcheck",
     summary="Defensive security scan for third-party agent skills.",
@@ -504,7 +558,11 @@ _COMPLETION_PATHS = ("/chat/completions", "/completions", "/responses", "/messag
 # person who reads Italian. The prompts belong to skillspector and are pinned
 # by commit, so the instruction travels with the request instead of patching
 # the library; it names only the two prose fields and asks that everything the
-# schema fixes stays as the schema defines it.
+# schema fixes stays as the schema defines it. It is also restated after the
+# last message: on 22 October one analyzer of a scan answered in English while
+# the others followed the leading instruction, because the rule text and the
+# numbered file arrive as one long user message and the front of the
+# conversation is far from where the model writes.
 _ITALIAN_FINDINGS_INSTRUCTION = (
     "Language of the answer: write the values of the JSON fields `explanation` "
     "and `remediation` of every finding in Italian, in plain words a non-technical "
@@ -514,12 +572,20 @@ _ITALIAN_FINDINGS_INSTRUCTION = (
     "schema defines it, in English where the schema says so."
 )
 
+_ITALIAN_FINDINGS_RESTATED = (
+    "Reminder: the values of `explanation` and `remediation` of every finding "
+    "are written in Italian, and every other value keeps the exact spelling the "
+    "response schema defines."
+)
+
 
 def _with_findings_language(body: bytes) -> bytes:
-    """The request body with the Italian instruction as its first message.
+    """The request body with the Italian instruction around its messages.
 
-    A body that is not a JSON object holding a ``messages`` list is returned as
-    it came, and so is one that already starts with the instruction.
+    The instruction is prepended as the first message unless it is already
+    there, and restated as the last message unless that message already is the
+    restatement, so a second pass changes nothing. A body that is not a JSON
+    object holding a ``messages`` list is returned as it came.
     """
     try:
         data = json.loads(body)
@@ -527,14 +593,22 @@ def _with_findings_language(body: bytes) -> bytes:
         return body
     if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
         return body
-    messages = data["messages"]
-    if (
+    messages = list(data["messages"])
+    changed = False
+    if not (
         messages
         and isinstance(messages[0], dict)
         and messages[0].get("content") == _ITALIAN_FINDINGS_INSTRUCTION
     ):
+        messages.insert(0, {"role": "system", "content": _ITALIAN_FINDINGS_INSTRUCTION})
+        changed = True
+    restated = {"role": "system", "content": _ITALIAN_FINDINGS_RESTATED}
+    if not (messages and messages[-1] == restated):
+        messages.append(restated)
+        changed = True
+    if not changed:
         return body
-    data["messages"] = [{"role": "system", "content": _ITALIAN_FINDINGS_INSTRUCTION}, *messages]
+    data["messages"] = messages
     return json.dumps(data).encode("utf-8")
 
 
