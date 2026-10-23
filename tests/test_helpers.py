@@ -163,6 +163,35 @@ def test_litellm_unreachable_host_returns_false(monkeypatch):
     assert server._litellm_reachable() is False
 
 
+def test_a_busy_litellm_is_reachable_by_the_default_probe(monkeypatch):
+    # LiteLLM serves on one worker, and an assistant's turn opening beside a
+    # scan held its liveness answer for about six seconds on a test machine
+    # (23 October): the probe's five seconds read that as unreachable and the
+    # scan of a person's fix degraded to static, left unscanned. A host that
+    # answers late is reachable; only one that does not answer at all is not.
+    import http.server
+    import threading
+    import time
+
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (http.server's naming)
+            time.sleep(6.5)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *_args):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("LITELLM_BASE_URL", f"http://127.0.0.1:{httpd.server_address[1]}")
+        assert server._litellm_reachable() is True
+    finally:
+        httpd.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Verdict mapping is defensive (schema drift → well-formed verdict, not a 500)
 # ---------------------------------------------------------------------------

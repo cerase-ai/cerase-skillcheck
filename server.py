@@ -122,7 +122,7 @@ Env
                              skillcheck). NEVER the master key. Enables LLM mode.
   SKILLCHECK_LLM_MODEL       model alias to route at (default "core"; a cheaper
                              switch is e.g. "spark").
-  SKILLCHECK_LLM_PROBE_TIMEOUT reachability-probe timeout, seconds (default 5).
+  SKILLCHECK_LLM_PROBE_TIMEOUT reachability-probe timeout, seconds (default 30).
 """
 from __future__ import annotations
 
@@ -170,7 +170,12 @@ _LLM_SCAN_TIMEOUT = int(os.environ.get("SKILLCHECK_LLM_SCAN_TIMEOUT", "1800"))
 _SCAN_DEADLINE = float(os.environ.get("SKILLCHECK_SCAN_DEADLINE", "2100"))
 _MAX_CONCURRENT_SCANS = max(1, int(os.environ.get("SKILLCHECK_MAX_CONCURRENT_SCANS", "2")))
 _MAX_UPLOAD = int(os.environ.get("SKILLCHECK_MAX_UPLOAD", str(25 * 1024 * 1024)))
-_PROBE_TIMEOUT = float(os.environ.get("SKILLCHECK_LLM_PROBE_TIMEOUT", "5"))
+# 30 and not 5: LiteLLM serves on one worker, and an assistant's turn opening
+# beside a scan held its liveness answer about six seconds on a test machine
+# (23 October), so a five-second probe read a busy LiteLLM as a dead one and the
+# scan of a person's fix degraded to static. A refused connection or a name that
+# does not resolve still fails at once; only a host that answers late waits.
+_PROBE_TIMEOUT = float(os.environ.get("SKILLCHECK_LLM_PROBE_TIMEOUT", "30"))
 _DEFAULT_LLM_MODEL = "core"
 
 # How often a blocked scan step (waiting for a slot, waiting on the scanner)

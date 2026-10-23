@@ -111,7 +111,7 @@ waiting for a slot stops waiting when its client disconnects, and takes none.
 | `LITELLM_BASE_URL` | unset | LiteLLM base URL; with the key below, turns LLM analysis on. |
 | `SKILLCHECK_LLM_API_KEY` | unset | LiteLLM key for this service; with the URL above, turns LLM analysis on. |
 | `SKILLCHECK_LLM_MODEL` | `core` | LiteLLM model alias the analysis uses. |
-| `SKILLCHECK_LLM_PROBE_TIMEOUT` | `5` | Timeout of the LiteLLM reachability check, in seconds. |
+| `SKILLCHECK_LLM_PROBE_TIMEOUT` | `30` | Timeout of the LiteLLM reachability check, in seconds. A refused connection fails at once; a LiteLLM busy with an assistant's turn answers within it. |
 
 The three timeouts are ordered so each layer outlasts the one inside it: a
 model call (`SKILLCHECK_LLM_CALL_TIMEOUT`, 900 s) is not cut by the model step
