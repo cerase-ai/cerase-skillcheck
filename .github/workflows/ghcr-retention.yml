@@ -53,7 +53,7 @@ jobs:
       GHCR_RETENTION_DRY_RUN: ${{ inputs.dry_run }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # The grep is half the check: sha256sum passes a pin that no longer lists
       # the file, and a pin that pins nothing is the failure this cannot afford.
@@ -79,7 +79,7 @@ jobs:
       GHCR_RETENTION_DRY_RUN: ${{ inputs.dry_run }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Verify the vendored tooling against its pin
         run: |
