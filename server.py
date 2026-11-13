@@ -43,8 +43,8 @@ Analysis modes (M-SKILLSCAN-2)
   the same fact to a caller.
 
 Endpoints
-  GET  /healthz        liveness + scanner version + LLM configuration + how many
-                       scans are running right now.
+  GET  /healthz        liveness + scanner version + ruleset fingerprint + LLM
+                       configuration + how many scans are running right now.
   POST /scan           JSON {path?|skill_md?} → verdict (mounted dir/file, or
                        raw SKILL.md content).
   POST /scan/bundle    multipart upload of a .zip skill bundle → verdict.
@@ -80,6 +80,7 @@ Verdict JSON
     "recommendation": "SAFE|CAUTION|DO_NOT_INSTALL",
     "findings": [ ... ],                         # skillspector issues[]
     "scanner_version": "2.3.9",
+    "ruleset": "<16 hex characters>",            # fingerprint of the rule text
     "mode": "static" | "llm",                    # analysis actually performed
     "degraded": bool,                            # LLM requested but fell back
     "partial": bool,                             # true = SKILL.md-only scan
@@ -128,6 +129,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import importlib.util
 import itertools
 import json
 import logging
@@ -288,6 +291,23 @@ _SKILLSPECTOR_SQP3_LANGUAGE_ITEM = (
 )
 
 
+def _insert_list_item(source: str, anchor: str, item: str, rule: str) -> str:
+    """Append *item* to the list *anchor* ends, at its single blank line.
+
+    *anchor* spans the list's last entry and the blank line before the text
+    that follows it, so the insertion point is unambiguous and applying the
+    patch twice fails loudly. Raises :class:`SkillspectorPatchError` when the
+    anchor is absent or not unique.
+    """
+    count = source.count(anchor)
+    if count != 1:
+        raise SkillspectorPatchError(
+            f"expected exactly one {rule} anchor in the skillspector source, found {count}"
+        )
+    replacement = anchor.replace("\n\n", "\n" + item + "\n", 1)
+    return source.replace(anchor, replacement, 1)
+
+
 def _patch_skillspector_sqp3(source: str) -> str:
     """Insert the language item into skillspector's SQP-3 ``Do NOT flag if`` list.
 
@@ -300,17 +320,84 @@ def _patch_skillspector_sqp3(source: str) -> str:
     the insertion point, so applying this twice also fails loudly.
     """
     _, anchor = _SKILLSPECTOR_SQP3_PATCH
-    count = source.count(anchor)
-    if count != 1:
-        raise SkillspectorPatchError(
-            f"expected exactly one SQP-3 anchor in the skillspector source, found {count}"
-        )
-    replacement = (
-        "  region-specific compliance tool)\n"
-        + _SKILLSPECTOR_SQP3_LANGUAGE_ITEM
-        + "\nUse rule ID **SQP-3**"
-    )
-    return source.replace(anchor, replacement, 1)
+    return _insert_list_item(source, anchor, _SKILLSPECTOR_SQP3_LANGUAGE_ITEM, "SQP-3")
+
+
+# ---------------------------------------------------------------------------
+# Build-time patch: SQP-2 and SDI-2 no longer ask a skill to repeat Cerase's
+# connector controls
+# ---------------------------------------------------------------------------
+#
+# A skill on Cerase reaches mail, sheets, CRMs and calendars only through
+# connector tools. Cerase's gateway decides every such call at the autonomy
+# level the organisation's administrator set: a write waits for the person's
+# approval unless the administrator chose otherwise, and personal data reaches
+# the model masked. The pinned SQP-2 prompt instead asks the skill to write its
+# own confirmation or log for a connector write, and SDI-2 flags a connector
+# call as a capability the manifest did not justify. Both prompts belong to
+# skillspector and are pinned by commit, so the image build patches them the
+# same way it patches SQP-3, and fails the build if a block moves.
+
+# (path under the skillspector package, the text around the insertion point)
+_SKILLSPECTOR_SQP2_PATCH: tuple[str, str] = (
+    "nodes/analyzers/semantic_quality_policy.py",
+    "  skill running shell commands is expected, not a missing warning)\n\n**For markdown files:**",
+)
+
+_SKILLSPECTOR_SDI2_PATCH: tuple[str, str] = (
+    "nodes/analyzers/semantic_developer_intent.py",
+    "- The manifest explicitly declares the capability as part of the skill's scope\n\nUse rule ID **SDI-2**",
+)
+
+_SKILLSPECTOR_SQP2_CONNECTOR_ITEM = (
+    "- The skill runs on Cerase and the operation is a call to a connector tool:\n"
+    "  reading or writing a mailbox, a sheet, a CRM, a calendar or another\n"
+    "  connected service. Cerase's gateway decides every such call at the\n"
+    "  autonomy level the organisation's administrator set: a write waits for the\n"
+    "  person's approval unless the administrator chose otherwise, and personal\n"
+    "  data reaches the model masked. A warning or confirmation written in the\n"
+    "  skill would duplicate that, so do not flag it, in code files or in markdown\n"
+    "  files. Still flag missing warnings for code the skill ships or tells the\n"
+    "  assistant to run, shell commands, files it deletes or overwrites, and\n"
+    "  network calls made outside a connector.\n"
+)
+
+_SKILLSPECTOR_SDI2_CONNECTOR_ITEM = (
+    "- The skill runs on Cerase and the capability is a connector the skill names\n"
+    "  and uses for its stated purpose, such as reading a mailbox or a CRM or\n"
+    "  writing to a sheet. On Cerase an assistant reaches only the connectors\n"
+    "  bound to it, at the autonomy level its administrator set, so such a\n"
+    "  connector is not context-inappropriate. Still flag a capability reached\n"
+    "  outside connectors, or one unrelated to the stated purpose.\n"
+)
+
+
+def _patch_skillspector_sqp2(source: str) -> str:
+    """Insert the connector item into skillspector's SQP-2 ``Do NOT flag`` list.
+
+    *source* is the file's text. The item is added after the list's existing
+    entries and before the blank line that precedes the markdown criteria,
+    worded so a connector call is not reported for lacking a warning Cerase's
+    gateway already applies. Raises :class:`SkillspectorPatchError` when the
+    anchor is absent or not unique, so a skillspector bump that moves the block
+    fails the build instead of silently restoring the false positives.
+    """
+    _, anchor = _SKILLSPECTOR_SQP2_PATCH
+    return _insert_list_item(source, anchor, _SKILLSPECTOR_SQP2_CONNECTOR_ITEM, "SQP-2")
+
+
+def _patch_skillspector_sdi2(source: str) -> str:
+    """Insert the connector item into skillspector's SDI-2 ``Do NOT flag if`` list.
+
+    *source* is the file's text. The item is added after the list's existing
+    entries and before the rule's summary line, worded so a connector the skill
+    names and uses for its stated purpose is not reported as context-
+    inappropriate. Raises :class:`SkillspectorPatchError` when the anchor is
+    absent or not unique, so a skillspector bump that moves the block fails the
+    build instead of silently restoring the false positives.
+    """
+    _, anchor = _SKILLSPECTOR_SDI2_PATCH
+    return _insert_list_item(source, anchor, _SKILLSPECTOR_SDI2_CONNECTOR_ITEM, "SDI-2")
 
 
 app = FastAPI(
@@ -337,6 +424,61 @@ def _scanner_version() -> str:
         except PackageNotFoundError:
             _SCANNER_VERSION = "unknown"
     return _SCANNER_VERSION
+
+
+_RULESET: str | None = None
+
+
+def _ruleset_fingerprint(root: Path) -> str:
+    """SHA-256 of the regular files under *root*, as 16 lowercase hex characters.
+
+    Each file contributes its relative POSIX path, a NUL, its byte length in
+    decimal, a NUL and then its bytes, in path order. Caches and bytecode are
+    skipped, so the fingerprint tracks the rule text and not how Python
+    happened to import it.
+    """
+    digest = hashlib.sha256()
+    files = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if "__pycache__" in relative.parts or relative.suffix in {".pyc", ".pyo"}:
+            continue
+        files.append((relative.as_posix(), path))
+    for relative, path in sorted(files):
+        data = path.read_bytes()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(len(data)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data)
+    return digest.hexdigest()[:16]
+
+
+def _ruleset() -> str:
+    """Fingerprint of the installed rule text, resolved once and held in memory.
+
+    The image build patches skillspector's rule prompts, so this changes when a
+    patch item changes or when the pinned skillspector commit moves, while
+    ``scanner_version`` does not. The control-plane stores it with each verdict
+    and scans a held skill again when it differs.
+
+    ``/healthz`` reads this on the event loop, so it must never reach the disk
+    after the first call: the tree is read once and the result is held.
+    """
+    global _RULESET
+    if _RULESET is None:
+        try:
+            spec = importlib.util.find_spec("skillspector")
+            locations = None if spec is None else spec.submodule_search_locations
+            if not locations:
+                _RULESET = "unknown"
+            else:
+                _RULESET = _ruleset_fingerprint(Path(locations[0]))
+        except (ImportError, ValueError, OSError):
+            _RULESET = "unknown"
+    return _RULESET
 
 
 # ---------------------------------------------------------------------------
@@ -860,6 +1002,7 @@ class Verdict(BaseModel):
     recommendation: str
     findings: list[dict[str, Any]]
     scanner_version: str
+    ruleset: str = "unknown"
     mode: str = MODE_STATIC
     degraded: bool = False
     partial: bool = False
@@ -1054,6 +1197,7 @@ def _to_verdict(data: dict[str, Any], *, partial: bool, mode: str, degraded: boo
         recommendation=recommendation,
         findings=findings,
         scanner_version=str(meta.get("skillspector_version") or _scanner_version()),
+        ruleset=_ruleset(),
         mode=mode,
         degraded=degraded,
         partial=partial,
@@ -1162,6 +1306,7 @@ async def healthz() -> dict[str, Any]:
         "service": "cerase-skillcheck",
         "scanner": "skillspector",
         "scanner_version": version,
+        "ruleset": _ruleset(),
         "scanner_available": version != "unknown",
         "llm_configured": llm_on,
         "llm_model": _llm_model() if llm_on else None,

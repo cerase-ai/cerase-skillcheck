@@ -18,7 +18,7 @@ when a scan is requested and stops after a quiet period.
 
 | Method | Path | Input | Returns |
 |---|---|---|---|
-| `GET` | `/healthz` | none | Status, scanner version, whether LLM analysis is configured and with which model, scans in flight, age of the oldest one, the concurrency limit and the request deadline. |
+| `GET` | `/healthz` | none | Status, scanner version, the ruleset fingerprint, whether LLM analysis is configured and with which model, scans in flight, age of the oldest one, the concurrency limit and the request deadline. |
 | `POST` | `/scan` | JSON with exactly one of `path` or `skill_md` | A verdict. |
 | `POST` | `/scan/bundle` | multipart upload of a `.zip` skill bundle | A verdict. |
 
@@ -39,6 +39,7 @@ bundle over `SKILLCHECK_MAX_UPLOAD` 413, and a scan the scanner cannot complete
   "recommendation": "DO_NOT_INSTALL",
   "findings": [ { "rule_id": "...", "severity": "...", "message": "...", "file": "...", "confidence": 0.9 } ],
   "scanner_version": "2.3.9",
+  "ruleset": "0123456789abcdef",
   "mode": "llm",
   "degraded": false,
   "partial": false,
@@ -124,7 +125,17 @@ timeout, so the image build patches the two literals that hardcode 120 s to
 read `SKILLCHECK_LLM_CALL_TIMEOUT`, and fails the build if either line is
 missing. It also adds a missing item to SQP-3's "Do NOT flag if" list, so a
 skill merely written in a language other than English is not reported as
-forcing one.
+forcing one. The same step adds an item to SQP-2's and SDI-2's "Do NOT flag" lists:
+on Cerase a connector call is decided by the gateway at the autonomy the
+administrator set, so a skill is not asked to repeat that confirmation or
+privacy notice. Code, shell commands, files and network calls outside a
+connector are still flagged.
+
+`ruleset` is a 16-character fingerprint of the installed rule text, patches
+included, reported by `/healthz` and in every verdict; `scanner_version` does
+not change when the build patches the rules or the pinned commit moves, so the
+control-plane compares `ruleset` to decide whether a held skill was judged
+under other rules.
 
 ## Build and run locally
 

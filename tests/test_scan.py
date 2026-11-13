@@ -23,6 +23,7 @@ pure mode/degrade decision logic is unit-tested in ``test_helpers.py``.
 from __future__ import annotations
 
 import os
+import re
 
 import httpx
 import pytest
@@ -94,6 +95,7 @@ def _assert_well_formed(verdict: dict, *, expect_partial: bool, llm_configured: 
     assert verdict["recommendation"] in VALID_RECOMMENDATIONS
     assert isinstance(verdict["findings"], list)
     assert verdict["scanner_version"]
+    assert re.fullmatch(r"[0-9a-f]{16}", verdict["ruleset"])
     assert verdict["mode"] in {"static", "llm"}
     assert isinstance(verdict["degraded"], bool)
     if not llm_configured:
@@ -110,6 +112,7 @@ def test_healthz(client):
     assert body["status"] == "ok"
     assert body["scanner"] == "skillspector"
     assert body["scanner_version"]
+    assert re.fullmatch(r"[0-9a-f]{16}", body["ruleset"])
     assert body["mode"] in {"static", "llm"}
     assert "llm_configured" in body
 

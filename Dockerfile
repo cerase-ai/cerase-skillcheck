@@ -36,6 +36,11 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # fails this build instead of silently restoring the cut. The same block also
 # adds a missing item to SQP-3's "Do NOT flag if" list, so a skill merely
 # written in a language other than English is not reported as forcing one.
+# It also adds an item to SQP-2's and SDI-2's "Do NOT flag" lists: on Cerase a
+# connector call is decided by the gateway at the autonomy the administrator
+# set, so a skill is not asked to repeat that confirmation or privacy notice.
+# Code, shell commands, files and network calls outside a connector are still
+# flagged.
 COPY server.py /tmp/cerase-patch/server.py
 RUN python - <<'PY'
 import pathlib
@@ -55,12 +60,16 @@ for relative, line in server._SKILLSPECTOR_TIMEOUT_PATCHES:
         encoding="utf-8",
     )
 
-sqp3_path = root / server._SKILLSPECTOR_SQP3_PATCH[0]
-original = sqp3_path.read_text(encoding="utf-8")
-sqp3_path.write_text(
-    server._patch_skillspector_sqp3(original),
-    encoding="utf-8",
-)
+for (relative, _), patcher in (
+    (server._SKILLSPECTOR_SQP3_PATCH, server._patch_skillspector_sqp3),
+    (server._SKILLSPECTOR_SQP2_PATCH, server._patch_skillspector_sqp2),
+    (server._SKILLSPECTOR_SDI2_PATCH, server._patch_skillspector_sdi2),
+):
+    rule_path = root / relative
+    rule_path.write_text(
+        patcher(rule_path.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
 PY
 
 # ---- runtime ---------------------------------------------------------------
