@@ -55,7 +55,8 @@ bundle over `SKILLCHECK_MAX_UPLOAD` 413, and a scan the scanner cannot complete
   scan of the whole skill.
 - `mode` is the analysis actually performed, `static` or `llm`.
 - `degraded: true` means LLM analysis was requested and the verdict is static
-  only.
+  only. A scan in which any of skillspector's three semantic analysers got no
+  usable answer is degraded too.
 
 ## Static and LLM analysis
 

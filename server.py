@@ -36,11 +36,11 @@ Analysis modes (M-SKILLSCAN-2)
   a bundle finishes in 2.4s instead of 187s, and the verdict was `SAFE / LOW /
   0` with `degraded: false`. So the LLM traffic is routed through a loopback
   forwarder (`_CompletionProxy`) that counts the responses actually carrying
-  output; a stage that was requested and produced none is `static` +
-  `degraded: true`, exactly like one that ran out of time. The count is the
-  discriminator, never the reason for the failure — a rejected key, a rate
-  limit, a refused connection and a 200 with an empty `choices` array are all
-  the same fact to a caller.
+  output, per analyser as well as in total; when any of the three semantic
+  analysers got nothing back, the scan is `static` + `degraded: true`, exactly
+  like one that ran out of time. The count is the discriminator, never the
+  reason for the failure — a rejected key, a rate limit, a refused connection
+  and a 200 with an empty `choices` array are all the same fact to a caller.
 
 Endpoints
   GET  /healthz        liveness + scanner version + ruleset fingerprint + LLM
@@ -406,6 +406,112 @@ def _patch_skillspector_sdi2(source: str) -> str:
     """
     _, anchor = _SKILLSPECTOR_SDI2_PATCH
     return _insert_list_item(source, anchor, _SKILLSPECTOR_SDI2_CONNECTOR_ITEM, "SDI-2")
+
+
+# ---------------------------------------------------------------------------
+# Build-time check: every analyser's prompt still starts with the text we use
+# to tell its calls apart
+# ---------------------------------------------------------------------------
+#
+# The engine decides which analyser asked by the text its prompt starts with,
+# so a skillspector bump that changes an opening would silently make every scan
+# look as if that analyser never answered. These rows let the image build check
+# the pinned sources and fail instead of degrading every scan.
+
+# (analyser id, path under the skillspector package, prompt variable, opening)
+_ANALYSER_PROMPTS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "semantic_developer_intent",
+        "nodes/analyzers/semantic_developer_intent.py",
+        "ANALYZER_PROMPT",
+        "You are a developer-intent auditor for AI agent skills.",
+    ),
+    (
+        "semantic_quality_policy",
+        "nodes/analyzers/semantic_quality_policy.py",
+        "ANALYZER_PROMPT",
+        "You are a quality and safety auditor for AI agent skills.",
+    ),
+    (
+        "semantic_security_discovery",
+        "nodes/analyzers/semantic_security_discovery.py",
+        "ANALYZER_PROMPT",
+        "You are a security analyzer for AI agent skill files.",
+    ),
+    (
+        "meta_analyzer",
+        "nodes/meta_analyzer.py",
+        "PER_FILE_ANALYSIS_PROMPT",
+        "You are a security analyst evaluating an agent skill for vulnerabilities.",
+    ),
+)
+
+_SEMANTIC_ANALYSERS: tuple[str, ...] = (
+    "semantic_developer_intent",
+    "semantic_quality_policy",
+    "semantic_security_discovery",
+)
+
+
+def _check_skillspector_analyser_opening(source: str, variable: str, opening: str) -> None:
+    """Fail unless *source* assigns *variable* a prompt starting with *opening*.
+
+    The engine tells the analysers' calls apart by the text their prompt starts
+    with, so a skillspector bump that changes an opening must fail the image
+    build instead of degrading every scan. Raises :class:`SkillspectorPatchError`
+    unless the assignment occurs exactly once.
+    """
+    marker = variable + ' = """\\\n' + opening
+    count = source.count(marker)
+    if count != 1:
+        raise SkillspectorPatchError(
+            f"expected exactly one {variable} starting {opening!r} in the "
+            f"skillspector source, found {count}"
+        )
+
+
+def _analyser_of(body: bytes) -> str | None:
+    """The analyser whose prompt opening the first user message starts with.
+
+    The body is read before the findings-language messages are added, so those
+    messages cannot hide the analyser that asked. Only the start of the message
+    counts: an opening quoted further in the skill text is not an answer from
+    that analyser. A body that is not JSON, or has no user message, is
+    unclassified.
+    """
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return None
+    text = None
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    text = part["text"]
+                    break
+        break
+    if text is None:
+        return None
+    text = text.lstrip()
+    for analyser, _relative, _variable, opening in _ANALYSER_PROMPTS:
+        if text.startswith(opening):
+            return analyser
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1336,16 +1442,26 @@ class _CompletionProxy:
         self._lock = threading.Lock()
         self._attempted = 0
         self._usable = 0
+        self._attempted_by_analyser: dict[str, int] = {}
+        self._usable_by_analyser: dict[str, int] = {}
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     # -- counters -----------------------------------------------------------
 
-    def _record(self, usable: bool) -> None:
+    def _record(self, usable: bool, analyser: str | None) -> None:
         with self._lock:
             self._attempted += 1
             if usable:
                 self._usable += 1
+            if analyser is not None:
+                self._attempted_by_analyser[analyser] = (
+                    self._attempted_by_analyser.get(analyser, 0) + 1
+                )
+                if usable:
+                    self._usable_by_analyser[analyser] = (
+                        self._usable_by_analyser.get(analyser, 0) + 1
+                    )
 
     @property
     def attempted_completions(self) -> int:
@@ -1356,6 +1472,16 @@ class _CompletionProxy:
     def usable_completions(self) -> int:
         with self._lock:
             return self._usable
+
+    @property
+    def attempted_by_analyser(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._attempted_by_analyser)
+
+    @property
+    def usable_by_analyser(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._usable_by_analyser)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -1436,7 +1562,11 @@ class _CompletionProxy:
         # Overwritten rather than defaulted: the value is ours to state, and a
         # scanner that ever set its own must not be able to relabel our spend.
         headers["x-cerase-call-type"] = "scan"
-        if method == "POST" and handler.path.split("?", 1)[0].endswith(_COMPLETION_PATHS):
+        is_completion = handler.path.split("?", 1)[0].endswith(_COMPLETION_PATHS)
+        # Classified on the original body: the findings-language messages are
+        # added below and must not hide the analyser that asked.
+        analyser = _analyser_of(body) if method == "POST" and is_completion else None
+        if method == "POST" and is_completion:
             body = _with_findings_language(body)
         request = urllib.request.Request(  # noqa: S310 (internal host)
             self._upstream + handler.path,
@@ -1469,8 +1599,8 @@ class _CompletionProxy:
         # Matched without the query string, so a client that appends one (an
         # api-version, a deployment) is still counted and its scan is not
         # degraded for a call it did make.
-        if handler.path.split("?", 1)[0].endswith(_COMPLETION_PATHS):
-            self._record(_is_usable_completion(status, payload))
+        if is_completion:
+            self._record(_is_usable_completion(status, payload), analyser)
 
         handler.send_response(status)
         handler.send_header("Content-Type", content_type)
@@ -1643,32 +1773,46 @@ def _run_skillspector(
             raise ScanError(f"could not parse skillspector report: {exc}") from exc
 
 
-def _llm_outcome(data: dict[str, Any], *, completions: int) -> tuple[str, bool]:
+def _unanswered_analysers(usable_by: dict[str, int]) -> tuple[str, ...]:
+    """The semantic analysers that got no usable answer, in the fixed order."""
+    return tuple(
+        analyser for analyser in _SEMANTIC_ANALYSERS if not usable_by.get(analyser)
+    )
+
+
+def _llm_outcome(
+    data: dict[str, Any], *, completions: int, unanswered: tuple[str, ...]
+) -> tuple[str, bool]:
     """Derive ``(mode, degraded)`` from the report AND the completions observed.
 
-    Two independent sources, and either one alone can degrade the verdict:
+    Three independent sources, and any one alone can degrade the verdict:
 
       - the report's ``metadata`` — ``llm_requested`` (the stage was asked for,
         i.e. not --no-llm) and ``meta_analysis_applied`` (skillspector's own
         account of whether it ran);
       - *completions*, how many model responses carried output back through the
-        scan's :class:`_CompletionProxy`.
+        scan's :class:`_CompletionProxy`;
+      - *unanswered*, the semantic analysers the proxy saw produce no usable
+        answer. Every LLM scan runs all three, so an answer from the meta
+        analyser alone is not an LLM pass.
 
-    The second exists because the first can claim a pass that never happened:
+    The counts exist because the report can claim a pass that never happened:
     skillspector's LLM nodes drop a failed batch and still record a successful
     call, so a scan whose every request was rejected reports
     ``meta_analysis_applied: true``. A stage that was requested and produced no
     completion is therefore ``static`` + ``degraded``, on the same footing as
     one killed by a timeout — the count decides, not the reason it is zero.
 
-    *completions* is required rather than defaulted so no caller can fall back
-    to trusting the metadata by omission.
+    *completions* and *unanswered* are required rather than defaulted so no
+    caller can fall back to trusting the metadata by omission.
     """
     meta = data.get("metadata") or {}
     requested = bool(meta.get("llm_requested"))
     applied = bool(meta.get("meta_analysis_applied"))
     if not requested:
         return MODE_STATIC, False
+    if unanswered:
+        return MODE_STATIC, True
     if applied and completions > 0:
         return MODE_LLM, False
     return MODE_STATIC, True
@@ -1793,13 +1937,19 @@ def _scan_target(target: Path, *, partial: bool, cancel: threading.Event | None 
             return verdict_for(data, mode=MODE_STATIC, degraded=True)
 
         completions = proxy.usable_completions
-        if completions == 0:
+        unanswered = _unanswered_analysers(proxy.usable_by_analyser)
+        if unanswered:
+            attempted = proxy.attempted_by_analyser
             logger.warning(
-                "LLM stage produced no usable completion in %d call(s) — verdict is "
-                "static and degraded",
-                proxy.attempted_completions,
+                "LLM stage got no usable answer from %s — verdict is static and degraded",
+                ", ".join(
+                    f"{analyser} ({attempted.get(analyser, 0)} call(s))"
+                    for analyser in unanswered
+                ),
             )
-        mode, degraded = _llm_outcome(data, completions=completions)
+        mode, degraded = _llm_outcome(
+            data, completions=completions, unanswered=unanswered
+        )
         return verdict_for(data, mode=mode, degraded=degraded)
 
 

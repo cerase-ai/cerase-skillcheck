@@ -131,23 +131,23 @@ def test_base_scan_env_strips_ambient_openai_creds(monkeypatch):
 
 def test_llm_outcome_applied_with_completions_is_llm_not_degraded():
     data = {"metadata": {"llm_requested": True, "meta_analysis_applied": True}}
-    assert server._llm_outcome(data, completions=2) == (server.MODE_LLM, False)
+    assert server._llm_outcome(data, completions=2, unanswered=()) == (server.MODE_LLM, False)
 
 
 def test_llm_outcome_requested_but_not_applied_is_static_degraded():
     # LLM was asked for but did not effectively run (unreachable / bad key /
     # every call failed) — the report reflects static analysis only.
     data = {"metadata": {"llm_requested": True, "meta_analysis_applied": False, "llm_degraded": True}}
-    assert server._llm_outcome(data, completions=0) == (server.MODE_STATIC, True)
+    assert server._llm_outcome(data, completions=0, unanswered=()) == (server.MODE_STATIC, True)
 
 
 def test_llm_outcome_not_requested_is_static_not_degraded():
     data = {"metadata": {"llm_requested": False, "meta_analysis_applied": False}}
-    assert server._llm_outcome(data, completions=0) == (server.MODE_STATIC, False)
+    assert server._llm_outcome(data, completions=0, unanswered=()) == (server.MODE_STATIC, False)
 
 
 def test_llm_outcome_missing_metadata_defaults_to_static():
-    assert server._llm_outcome({}, completions=0) == (server.MODE_STATIC, False)
+    assert server._llm_outcome({}, completions=0, unanswered=()) == (server.MODE_STATIC, False)
 
 
 # ---------------------------------------------------------------------------

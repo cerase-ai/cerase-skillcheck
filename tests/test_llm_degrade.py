@@ -143,16 +143,22 @@ import urllib.request
 argv = sys.argv[1:]
 out = argv[argv.index("--output") + 1]
 
+PROMPTS = (
+    "You are a developer-intent auditor for AI agent skills.",
+    "You are a quality and safety auditor for AI agent skills.",
+    "You are a security analyzer for AI agent skill files.",
+)
+
 base = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
 key = os.environ.get("OPENAI_API_KEY", "")
 if base:
-    payload = json.dumps(
-        {
-            "model": os.environ.get("SKILLSPECTOR_MODEL", "core"),
-            "messages": [{"role": "user", "content": "analyse this skill"}],
-        }
-    ).encode()
-    for _ in range(3):
+    for prompt in PROMPTS:
+        payload = json.dumps(
+            {
+                "model": os.environ.get("SKILLSPECTOR_MODEL", "core"),
+                "messages": [{"role": "user", "content": prompt + "\\n\\nanalyse this skill"}],
+            }
+        ).encode()
         request = urllib.request.Request(
             base + "/chat/completions",
             data=payload,
@@ -241,21 +247,21 @@ def test_the_service_key_still_reaches_the_router(fake_scanner, monkeypatch, tmp
 
 def test_llm_outcome_zero_completions_outranks_an_applied_claim():
     data = {"metadata": {"llm_requested": True, "meta_analysis_applied": True}}
-    assert server._llm_outcome(data, completions=0) == (server.MODE_STATIC, True)
+    assert server._llm_outcome(data, completions=0, unanswered=()) == (server.MODE_STATIC, True)
 
 
 def test_llm_outcome_completions_with_applied_claim_is_llm():
     data = {"metadata": {"llm_requested": True, "meta_analysis_applied": True}}
-    assert server._llm_outcome(data, completions=3) == (server.MODE_LLM, False)
+    assert server._llm_outcome(data, completions=3, unanswered=()) == (server.MODE_LLM, False)
 
 
 def test_llm_outcome_completions_do_not_override_a_degraded_report():
     """A report that admits the degradation is believed even with completions seen."""
     data = {"metadata": {"llm_requested": True, "meta_analysis_applied": False}}
-    assert server._llm_outcome(data, completions=3) == (server.MODE_STATIC, True)
+    assert server._llm_outcome(data, completions=3, unanswered=()) == (server.MODE_STATIC, True)
 
 
 def test_llm_outcome_static_run_is_not_degraded_by_a_zero_count():
     """A ``--no-llm`` run has no completions to produce and must not be flagged."""
     data = {"metadata": {"llm_requested": False, "meta_analysis_applied": False}}
-    assert server._llm_outcome(data, completions=0) == (server.MODE_STATIC, False)
+    assert server._llm_outcome(data, completions=0, unanswered=()) == (server.MODE_STATIC, False)

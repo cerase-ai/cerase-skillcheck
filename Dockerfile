@@ -40,7 +40,8 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # connector call is decided by the gateway at the autonomy the administrator
 # set, so a skill is not asked to repeat that confirmation or privacy notice.
 # Code, shell commands, files and network calls outside a connector are still
-# flagged.
+# flagged. The build also checks the four prompt openings the engine uses to
+# tell the analysers' calls apart.
 COPY server.py /tmp/cerase-patch/server.py
 RUN python - <<'PY'
 import pathlib
@@ -69,6 +70,11 @@ for (relative, _), patcher in (
     rule_path.write_text(
         patcher(rule_path.read_text(encoding="utf-8")),
         encoding="utf-8",
+    )
+
+for _analyser, relative, variable, opening in server._ANALYSER_PROMPTS:
+    server._check_skillspector_analyser_opening(
+        (root / relative).read_text(encoding="utf-8"), variable, opening
     )
 PY
 
