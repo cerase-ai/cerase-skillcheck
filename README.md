@@ -131,6 +131,13 @@ administrator set, so a skill is not asked to repeat that confirmation or
 privacy notice. Code, shell commands, files and network calls outside a
 connector are still flagged.
 
+On top of skillspector's rules the engine adds `CERASE-OUT-1`: a skill whose
+text sends data to an address outside the machine through no connector is held,
+whatever the model stage says. The rule is HIGH and adds 25, 12 and 6 to the
+score for the first three findings, so one finding makes the verdict at least
+CAUTION. The `ruleset` fingerprint covers this rule's text as well as the
+installed skillspector tree.
+
 `ruleset` is a 16-character fingerprint of the installed rule text, patches
 included, reported by `/healthz` and in every verdict; `scanner_version` does
 not change when the build patches the rules or the pinned commit moves, so the

@@ -111,7 +111,7 @@ def test_ruleset_uses_the_installed_package_tree_once(tmp_path, monkeypatch):
     _write_tree(root)
 
     real_fingerprint = server._ruleset_fingerprint
-    expected = real_fingerprint(root)
+    expected = server._combine_ruleset(real_fingerprint(root), server._cerase_rules_fingerprint())
     calls = []
 
     def counting_fingerprint(path):  # noqa: ANN001

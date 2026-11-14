@@ -78,7 +78,8 @@ Verdict JSON
     "score": 0-100,                              # skillspector risk score
     "severity": "LOW|MEDIUM|HIGH|CRITICAL",
     "recommendation": "SAFE|CAUTION|DO_NOT_INSTALL",
-    "findings": [ ... ],                         # skillspector issues[]
+    "findings": [ ... ],                         # skillspector issues[] plus the
+                                                 # engine's outbound rule
     "scanner_version": "2.3.9",
     "ruleset": "<16 hex characters>",            # fingerprint of the rule text
     "mode": "static" | "llm",                    # analysis actually performed
@@ -87,6 +88,10 @@ Verdict JSON
     "skill_name": str|null,
     "components_scanned": int
   }
+
+  On top of skillspector's findings the engine adds its own outbound rule: a
+  unit of skill text that sends data to an address outside the machine through
+  no connector is a HIGH finding, whatever the model stage says.
 
 skillspector invocation
   We shell out to the pinned CLI:
@@ -131,10 +136,13 @@ import asyncio
 import contextlib
 import hashlib
 import importlib.util
+import inspect
+import ipaddress
 import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -400,6 +408,509 @@ def _patch_skillspector_sdi2(source: str) -> str:
     return _insert_list_item(source, anchor, _SKILLSPECTOR_SDI2_CONNECTOR_ITEM, "SDI-2")
 
 
+# ---------------------------------------------------------------------------
+# Engine rule: a send to an address outside the machine holds the skill
+# ---------------------------------------------------------------------------
+#
+# skillspector's static External Transmission rule (E1) is MEDIUM, so by its
+# own score it can never hold a skill alone, and its model stage is told that
+# static rules already cover explicit HTTP sends. When the analyzers that read
+# intent add nothing, a skill that sends people's data out scans SAFE on that
+# one finding. On Cerase a send that leaves through no connector is never seen
+# by the gateway, so this rule holds it deterministically, in the engine,
+# whatever the model says.
+
+_OUTBOUND_RULE_ID = "CERASE-OUT-1"
+_OUTBOUND_MAX_FILE_BYTES = 1024 * 1024
+_OUTBOUND_NUL_SCAN_BYTES = 8 * 1024
+_OUTBOUND_PROSE_SUFFIXES = (".md", ".markdown", ".mdx", ".txt", ".rst")
+_OUTBOUND_SCORE_WEIGHTS = (25, 12, 6)
+
+# These are skillspector's own bands, from nodes/report.py
+# _RISK_SEVERITY_BANDS; the recommendation cut-offs use the same scores.
+_OUTBOUND_CRITICAL_SCORE = 81
+_OUTBOUND_HIGH_SCORE = 51
+_OUTBOUND_MEDIUM_SCORE = 21
+
+_INTERNAL_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/32"),
+)
+
+_OUTBOUND_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_OUTBOUND_URL_HOST_RE = re.compile(r"https?://([^/?#]+)", re.IGNORECASE)
+_OUTBOUND_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_OUTBOUND_IPV4_LIKE_RE = re.compile(r"^[0-9.]+$")
+_OUTBOUND_FENCE_RE = re.compile(r"^\s*(?:`{3,}|~{3,})")
+_OUTBOUND_MARKER_RE = re.compile(r"^\s*(?:[-*+](?:\s|$)|\d+[.)](?:\s|$)|#|>|\|)")
+_OUTBOUND_HEADING_RE = re.compile(r"^\s*#")
+
+_OUTBOUND_ENGLISH_VERBS = (
+    r"(?:send(?:s|ing)?|sent|post(?:s|ing|ed)?|upload(?:s|ing|ed)?"
+    r"|submit(?:s|ting|ted)?|transmit(?:s|ting|ted)?|forward(?:s|ing|ed)?)"
+)
+_OUTBOUND_ITALIAN_VERBS = (
+    r"(?:invi(?:a\w*|o|i|iamo|ate|ano|er\w*|and\w*|at\w*|ò)"
+    r"|mand(?:a\w*|o|i|iamo|ate|ano|er\w*|and\w*|at\w*|ò)"
+    r"|sped(?:isc\w*|ir\w*|i(?:amo|te|scono|sce|sco|va|vano|vo|vi)?|end\w*|it\w*)"
+    r"|trasmet(?:t\w*|ter\w*|tend\w*|s\w*)"
+    r"|caric(?:a\w*|o|hi|hiamo|ate|ano|are|her\w*|and\w*|at\w*|ò)"
+    r"|inoltr(?:a\w*|o|i|iamo|ate|ano|er\w*|and\w*|at\w*|ò))"
+)
+_OUTBOUND_VERBS = rf"(?:{_OUTBOUND_ENGLISH_VERBS}|{_OUTBOUND_ITALIAN_VERBS})"
+
+_OUTBOUND_ENGLISH_PREPS = r"\b(?:into|to|at|on)\b"
+_OUTBOUND_ITALIAN_PREPS = (
+    r"(?:(?<!\w)(?:all'|sull')"
+    r"|(?<!\w)(?:allo|alla|agli|alle|al|ai|ad|a|sullo|sulla|sul|su|verso|presso)(?!\w))"
+)
+_OUTBOUND_PREPS = rf"(?:{_OUTBOUND_ENGLISH_PREPS}|{_OUTBOUND_ITALIAN_PREPS})"
+
+_OUTBOUND_ARTICLES = (
+    r"(?:(?:the|a|an|this|that|these|those|il|lo|la|i|gli|le|un|uno|una"
+    r"|questo|questa|questi|queste|quel|quello|quella|quelli|quelle)\s+|l'|un')"
+)
+_OUTBOUND_NOUNS = r"(?:address|endpoint|url|webhook|server|service|site|indirizzo|servizio|sito)"
+
+_OUTBOUND_COMMAND_PATTERN = (
+    r"(?:"
+    r"\bcurl\b[\s\S]*?(?:"
+    r"(?<!\w)(?-i:-d)(?!\w)|(?<!\w)(?-i:-F)(?!\w)|(?<!\w)(?-i:-T)(?!\w)"
+    r"|--data(?:-[a-z-]+)?(?:=|\s)|--form(?:-string)?(?:=|\s)"
+    r"|--upload-file(?:=|\s)|--json(?:=|\s)"
+    r"|(?<!\w)(?-i:-X)\s*(?:POST|PUT|PATCH)\b"
+    r"|--request(?:\s+|=)(?:POST|PUT|PATCH)\b)"
+    r"|\bwget\b[\s\S]*?(?:"
+    r"--post-data(?:=|\s)|--post-file(?:=|\s)|--body-data(?:=|\s)"
+    r"|--body-file(?:=|\s)|--method(?:=|\s+)(?:POST|PUT|PATCH)\b)"
+    r"|\b(?:http|https|xh)\s+(?:POST|PUT|PATCH)\b"
+    r"|\b(?:Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b[\s\S]*?(?:"
+    r"-Method\s+(?:Post|Put|Patch)\b|-Body\b|-InFile\b)"
+    r"|\.(?:post|put|patch)\s*\("
+    r"|\bfetch\s*\([\s\S]*?\bmethod\s*:\s*[\"'](?:POST|PUT|PATCH)[\"']"
+    r"|\burlopen\s*\([\s\S]*?\bdata\s*="
+    r"|\bsendBeacon\s*\("
+    r")"
+)
+_OUTBOUND_COMMAND_RE = re.compile(_OUTBOUND_COMMAND_PATTERN, re.IGNORECASE)
+
+_OUTBOUND_SENTENCE_END_RE = re.compile(r"[.!?;]\s")
+_OUTBOUND_VERB_RE = re.compile(
+    r"\b" + _OUTBOUND_VERBS + r"\b",
+    re.IGNORECASE,
+)
+_OUTBOUND_DESTINATION_TAIL_RE = re.compile(
+    _OUTBOUND_PREPS
+    + r"\s*(?:(?:"
+    + _OUTBOUND_ARTICLES
+    + r")?"
+    + _OUTBOUND_NOUNS
+    + r"\b\s*)?:?\s*$",
+    re.IGNORECASE,
+)
+
+_OUTBOUND_REGEX_NAMES = (
+    "_OUTBOUND_URL_RE",
+    "_OUTBOUND_URL_HOST_RE",
+    "_OUTBOUND_HOSTNAME_RE",
+    "_OUTBOUND_IPV4_LIKE_RE",
+    "_OUTBOUND_FENCE_RE",
+    "_OUTBOUND_MARKER_RE",
+    "_OUTBOUND_HEADING_RE",
+    "_OUTBOUND_COMMAND_RE",
+    "_OUTBOUND_SENTENCE_END_RE",
+    "_OUTBOUND_VERB_RE",
+    "_OUTBOUND_DESTINATION_TAIL_RE",
+)
+
+_OUTBOUND_CONSTANT_NAMES = (
+    "_OUTBOUND_RULE_ID",
+    "_OUTBOUND_MAX_FILE_BYTES",
+    "_OUTBOUND_NUL_SCAN_BYTES",
+    "_OUTBOUND_PROSE_SUFFIXES",
+    "_OUTBOUND_SCORE_WEIGHTS",
+    "_OUTBOUND_CRITICAL_SCORE",
+    "_OUTBOUND_HIGH_SCORE",
+    "_OUTBOUND_MEDIUM_SCORE",
+    "_OUTBOUND_SEVERITY_ORDER",
+    "_OUTBOUND_RECOMMENDATION_ORDER",
+    "_INTERNAL_NETWORKS",
+)
+
+_OUTBOUND_FUNCTION_NAMES = (
+    "_outbound_sends",
+    "_outbound_units",
+    "_prose_sends",
+    "_outside_url",
+    "_is_outside_host",
+    "_host_of",
+    "_clean_url",
+    "_outbound_findings",
+    "_visible_text_files",
+    "_read_text_file",
+    "_with_cerase_findings",
+    "_severity_for_score",
+    "_recommendation_for_score",
+)
+
+
+def _clean_url(raw: str) -> str:
+    """Strip wrappers and sentence punctuation from a URL match."""
+    url = raw.strip()
+    while url:
+        before = url
+        url = url.strip("\"'`<>[]")
+        url = url.rstrip(".,;:)")
+        if url == before:
+            break
+    return url
+
+
+def _host_of(url: str) -> str | None:
+    """Return the lower-case host of *url*, or ``None`` when there is none."""
+    match = _OUTBOUND_URL_HOST_RE.match(url)
+    if match is None:
+        return None
+    authority = match.group(1).rsplit("@", 1)[-1]
+    if authority.startswith("["):
+        return None
+    host = authority.split(":", 1)[0].rstrip(".")
+    return host.lower() or None
+
+
+def _is_outside_host(host: str) -> bool:
+    """Whether *host* is a plain public hostname or a public IPv4 address."""
+    if not host or host == "localhost" or "." not in host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if _OUTBOUND_IPV4_LIKE_RE.match(host):
+            return False
+        labels = host.split(".")
+        return all(_OUTBOUND_HOSTNAME_RE.match(label) for label in labels)
+    if isinstance(address, ipaddress.IPv4Address):
+        return not any(address in network for network in _INTERNAL_NETWORKS)
+    return False
+
+
+def _outside_url(raw: str) -> str | None:
+    """Return the cleaned URL when it leaves the machine, else ``None``."""
+    url = _clean_url(raw)
+    host = _host_of(url)
+    if host is None or not _is_outside_host(host):
+        return None
+    return url
+
+
+def _outbound_units(
+    text: str, prose: bool = True
+) -> list[tuple[int, int | None, str]]:
+    """Split *text* into logical units of skill text.
+
+    In a prose file a unit is a physical line, a backslash continuation, a
+    hard-wrapped prose line, or one line inside a fenced code block. In a code
+    file a unit is a physical line plus its backslash continuations; fences and
+    hard wraps do not apply. Each entry is ``(start_line, end_line, unit_text)``
+    and a single-line unit has ``end_line`` of ``None``.
+    """
+    if not prose:
+        code_units: list[tuple[int, int | None, str]] = []
+        current_code: list[tuple[int, str]] = []
+
+        def flush_code() -> None:
+            nonlocal current_code
+            if current_code:
+                start = current_code[0][0]
+                end = current_code[-1][0] if len(current_code) > 1 else None
+                code_units.append(
+                    (start, end, "\n".join(line for _, line in current_code))
+                )
+                current_code = []
+
+        for lineno, line in enumerate(text.splitlines(), 1):
+            current_code.append((lineno, line))
+            if not line.rstrip().endswith("\\"):
+                flush_code()
+        flush_code()
+        return code_units
+
+    units: list[tuple[int, int | None, str]] = []
+    current: list[tuple[int, str]] | None = None
+    current_kind = ""
+    in_fence = False
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            start = current[0][0]
+            end = current[-1][0] if len(current) > 1 else None
+            units.append((start, end, "\n".join(line for _, line in current)))
+            current = None
+
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        is_fence = bool(_OUTBOUND_FENCE_RE.match(line))
+        continues = bool(current and current[-1][1].rstrip().endswith("\\"))
+
+        if continues:
+            current.append((lineno, line))
+            if is_fence:
+                in_fence = not in_fence
+            if not line.rstrip().endswith("\\"):
+                flush()
+            continue
+
+        if in_fence:
+            flush()
+            if is_fence:
+                units.append((lineno, None, line))
+                in_fence = False
+            else:
+                current = [(lineno, line)]
+                current_kind = "fence"
+                if not line.rstrip().endswith("\\"):
+                    flush()
+            continue
+
+        if is_fence:
+            flush()
+            current = [(lineno, line)]
+            current_kind = "fence"
+            in_fence = True
+            if not line.rstrip().endswith("\\"):
+                flush()
+            continue
+
+        if stripped == "":
+            flush()
+            continue
+
+        marker = bool(_OUTBOUND_MARKER_RE.match(line))
+        if (
+            current is not None
+            and current_kind == "prose"
+            and not marker
+            and not line.rstrip().endswith("\\")
+        ):
+            current.append((lineno, line))
+        else:
+            flush()
+            current = [(lineno, line)]
+            current_kind = "heading" if _OUTBOUND_HEADING_RE.match(line) else "prose"
+
+    flush()
+    return units
+
+
+def _prose_sends(prefix: str) -> bool:
+    """Whether a send verb reaches the destination just after *prefix*."""
+    prefix = prefix.rstrip()
+    while prefix and prefix[-1] in "\"'`<[({":
+        prefix = prefix[:-1].rstrip()
+    last_end = 0
+    for match in _OUTBOUND_SENTENCE_END_RE.finditer(prefix):
+        last_end = match.end()
+    prefix = prefix[last_end:]
+    tail = _OUTBOUND_DESTINATION_TAIL_RE.search(prefix)
+    if tail is None:
+        return False
+    return bool(_OUTBOUND_VERB_RE.search(prefix[: tail.start()]))
+
+
+def _outbound_sends(text: str, file: str) -> list[dict[str, Any]]:
+    """Return one HIGH finding per unit that sends data off the machine."""
+    suffix = Path(file).suffix.lower()
+    prose = not suffix or suffix in _OUTBOUND_PROSE_SUFFIXES
+    findings: list[dict[str, Any]] = []
+    for start_line, end_line, unit in _outbound_units(text, prose=prose):
+        outside: list[tuple[int, str]] = []
+        for match in _OUTBOUND_URL_RE.finditer(unit):
+            candidate = _outside_url(match.group(0))
+            if candidate is not None:
+                outside.append((match.start(), candidate))
+        if not outside:
+            continue
+        if _OUTBOUND_COMMAND_RE.search(unit):
+            url = outside[0][1]
+        else:
+            url = None
+            for url_start, candidate in outside:
+                if _prose_sends(unit[:url_start]):
+                    url = candidate
+                    break
+            if url is None:
+                continue
+        findings.append(
+            {
+                "id": _OUTBOUND_RULE_ID,
+                "category": "Data Exfiltration",
+                "pattern": "Data sent outside a connector",
+                "severity": "HIGH",
+                "confidence": 1.0,
+                "location": {
+                    "file": file,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                },
+                "finding": url,
+                "explanation": (
+                    f"Le istruzioni inviano dati a {url}, un indirizzo raggiunto "
+                    "senza alcun connettore: il gateway di Cerase non vede questo "
+                    "invio e non chiede alcuna approvazione, e i dati escono così "
+                    "come sono."
+                ),
+                "remediation": (
+                    "Se i dati devono raggiungere quel servizio, usa il suo "
+                    "connettore così l'invio passa dal gateway; altrimenti rimuovi "
+                    "l'invio."
+                ),
+                "code_snippet": unit,
+                "intent": None,
+                "tags": ["Data Exfiltration"],
+            }
+        )
+    return findings
+
+
+def _visible_text_files(path: Path) -> list[tuple[str, Path]]:
+    """List text files under *path* in sorted order, skipping hidden paths."""
+    if path.is_file():
+        relative = Path(path.name)
+        if any(part.startswith(".") for part in relative.parts):
+            return []
+        return [(relative.as_posix(), path)]
+    if not path.is_dir():
+        return []
+
+    found: list[tuple[str, Path]] = []
+    try:
+        for candidate in path.rglob("*"):
+            try:
+                if not candidate.is_file():
+                    continue
+            except OSError:
+                continue
+            relative = candidate.relative_to(path)
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            found.append((relative.as_posix(), candidate))
+    except OSError:
+        return []
+    found.sort(key=lambda item: item[0])
+    return found
+
+
+def _read_text_file(path: Path) -> str | None:
+    """Read *path* as UTF-8 text, or return ``None`` when it must be skipped."""
+    try:
+        if path.stat().st_size > _OUTBOUND_MAX_FILE_BYTES:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) > _OUTBOUND_MAX_FILE_BYTES:
+        return None
+    if b"\x00" in data[:_OUTBOUND_NUL_SCAN_BYTES]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _outbound_findings(path: Path) -> list[dict[str, Any]]:
+    """Walk *path* and return every outbound finding, never raising."""
+    findings: list[dict[str, Any]] = []
+    for relative, file_path in _visible_text_files(Path(path)):
+        text = _read_text_file(file_path)
+        if text is None:
+            continue
+        findings.extend(_outbound_sends(text, relative))
+    return findings
+
+
+_OUTBOUND_SEVERITY_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+_OUTBOUND_RECOMMENDATION_ORDER = {"SAFE": 0, "CAUTION": 1, "DO_NOT_INSTALL": 2}
+
+
+def _severity_for_score(score: int) -> str:
+    if score >= _OUTBOUND_CRITICAL_SCORE:
+        return "CRITICAL"
+    if score >= _OUTBOUND_HIGH_SCORE:
+        return "HIGH"
+    if score >= _OUTBOUND_MEDIUM_SCORE:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _recommendation_for_score(score: int) -> str:
+    if score >= _OUTBOUND_HIGH_SCORE:
+        return "DO_NOT_INSTALL"
+    if score >= _OUTBOUND_MEDIUM_SCORE:
+        return "CAUTION"
+    return "SAFE"
+
+
+def _with_cerase_findings(
+    verdict: Verdict, findings: list[dict[str, Any]]
+) -> Verdict:
+    """Add the engine's findings to *verdict* and raise its score and band."""
+    if not findings:
+        return verdict
+    counted = min(len(findings), len(_OUTBOUND_SCORE_WEIGHTS))
+    score = min(100, verdict.score + sum(_OUTBOUND_SCORE_WEIGHTS[:counted]))
+    severity = _severity_for_score(score)
+    recommendation = _recommendation_for_score(score)
+    if _OUTBOUND_SEVERITY_ORDER.get(verdict.severity, 0) > _OUTBOUND_SEVERITY_ORDER[severity]:
+        severity = verdict.severity
+    if (
+        _OUTBOUND_RECOMMENDATION_ORDER.get(verdict.recommendation, 0)
+        > _OUTBOUND_RECOMMENDATION_ORDER[recommendation]
+    ):
+        recommendation = verdict.recommendation
+    return verdict.model_copy(
+        update={
+            "score": score,
+            "severity": severity,
+            "recommendation": recommendation,
+            "findings": [*verdict.findings, *findings],
+        }
+    )
+
+
+def _function_source(function: Any) -> str:
+    """Source of *function*, or its representation when source is unavailable."""
+    try:
+        return inspect.getsource(function)
+    except (OSError, TypeError):
+        return repr(function)
+
+
+def _cerase_rules_fingerprint() -> str:
+    """Fingerprint the engine's own rule text, read from the current module."""
+    scope = globals()
+    parts = []
+    for name in _OUTBOUND_CONSTANT_NAMES:
+        parts.append(name + "=" + repr(scope.get(name)))
+    for name in _OUTBOUND_REGEX_NAMES:
+        # A compiled pattern's repr is cut at 200 characters, so the full
+        # pattern text and its flags are hashed instead.
+        value = scope.get(name)
+        if isinstance(value, re.Pattern):
+            parts.append(name + "=" + repr(value.pattern) + "/" + str(int(value.flags)))
+        else:
+            parts.append(name + "=" + repr(value))
+    for name in _OUTBOUND_FUNCTION_NAMES:
+        parts.append(name + "=" + _function_source(scope.get(name)))
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _combine_ruleset(tree: str, cerase: str) -> str:
+    """Combine the skillspector tree fingerprint with the engine's own."""
+    return hashlib.sha256((tree + "\0" + cerase).encode("utf-8")).hexdigest()[:16]
+
+
 app = FastAPI(
     title="cerase-skillcheck",
     summary="Defensive security scan for third-party agent skills.",
@@ -475,7 +986,10 @@ def _ruleset() -> str:
             if not locations:
                 _RULESET = "unknown"
             else:
-                _RULESET = _ruleset_fingerprint(Path(locations[0]))
+                _RULESET = _combine_ruleset(
+                    _ruleset_fingerprint(Path(locations[0])),
+                    _cerase_rules_fingerprint(),
+                )
         except (ImportError, ValueError, OSError):
             _RULESET = "unknown"
     return _RULESET
@@ -1233,13 +1747,21 @@ def _scan_target(target: Path, *, partial: bool, cancel: threading.Event | None 
     """
     budget = Budget(_SCAN_DEADLINE)
     with _scan_slot(budget, cancel):
+        outbound = _outbound_findings(target)
+
+        def verdict_for(data: dict[str, Any], *, mode: str, degraded: bool) -> Verdict:
+            return _with_cerase_findings(
+                _to_verdict(data, partial=partial, mode=mode, degraded=degraded),
+                outbound,
+            )
+
         if not _llm_configured():
             data = _run_skillspector(target, use_llm=False, budget=budget, cancel=cancel)
-            return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=False)
+            return verdict_for(data, mode=MODE_STATIC, degraded=False)
 
         if not _litellm_reachable():
             data = _run_skillspector(target, use_llm=False, budget=budget, cancel=cancel)
-            return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
+            return verdict_for(data, mode=MODE_STATIC, degraded=True)
 
         proxy = _CompletionProxy(_litellm_root(), budget)
         try:
@@ -1249,7 +1771,7 @@ def _scan_target(target: Path, *, partial: bool, cancel: threading.Event | None 
             # scan cannot be told apart from one that answered nothing.
             logger.warning("completion proxy did not start (%s) — scanning static", exc)
             data = _run_skillspector(target, use_llm=False, budget=budget, cancel=cancel)
-            return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
+            return verdict_for(data, mode=MODE_STATIC, degraded=True)
 
         try:
             try:
@@ -1268,7 +1790,7 @@ def _scan_target(target: Path, *, partial: bool, cancel: threading.Event | None 
             # flag the degradation.
             logger.warning("LLM scan failed (%s) — falling back to static", exc)
             data = _run_skillspector(target, use_llm=False, budget=budget, cancel=cancel)
-            return _to_verdict(data, partial=partial, mode=MODE_STATIC, degraded=True)
+            return verdict_for(data, mode=MODE_STATIC, degraded=True)
 
         completions = proxy.usable_completions
         if completions == 0:
@@ -1278,7 +1800,7 @@ def _scan_target(target: Path, *, partial: bool, cancel: threading.Event | None 
                 proxy.attempted_completions,
             )
         mode, degraded = _llm_outcome(data, completions=completions)
-        return _to_verdict(data, partial=partial, mode=mode, degraded=degraded)
+        return verdict_for(data, mode=mode, degraded=degraded)
 
 
 # ---------------------------------------------------------------------------
